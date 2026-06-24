@@ -1,0 +1,240 @@
+该文件是记录s01学习过程中发现值得优化的地方你这个问题已经到了**“多模型 + agent runtime 架构设计”核心层”**了，本质是：
+
+> 👉 我想要 Anthropic 的 block runtime，但又想兼容 OpenAI / DeepSeek / Gemini
+
+这是一个典型的：
+
+> **“统一 LLM 抽象层（LLM Runtime Abstraction Problem）”**
+
+我给你讲工程上真正的标准解法。
+
+---
+
+# 1. 先说结论（最重要）
+
+你想要的其实不是：
+
+> ❌ 直接用 Anthropic 或 DeepSeek SDK
+
+而是：
+
+> ✔ 自己做一层 “中间 runtime（统一 block 层）”
+> ✔ 或直接用 LiteLLM / LangGraph 这种封装
+
+---
+
+# 2. 核心矛盾（你现在困惑的点）
+
+| 系统        | 输出结构                             |
+| --------- | -------------------------------- |
+| Anthropic | blocks（TextBlock / ToolUseBlock） |
+| OpenAI    | JSON（message + tool_calls）       |
+| DeepSeek  | OpenAI兼容 JSON                    |
+| Gemini    | function calls + text            |
+
+👉 它们**根本不是同一种 runtime**
+
+---
+
+# 3. 你想要的目标其实是这个：
+
+```text
+统一结构：
+[
+  {"type": "text"},
+  {"type": "tool_use"},
+  {"type": "tool_result"}
+]
+```
+
+👉 也就是你自己定义一个：
+
+> 🧠 “Block Runtime Layer”
+
+---
+
+# 4. 标准工程方案（推荐）
+
+## ✔ 方案 A：LiteLLM（最推荐）
+
+直接解决你问题：
+
+```python
+from litellm import completion
+
+response = completion(
+    model="anthropic/claude-3-5-sonnet",
+    messages=messages
+)
+```
+
+换模型：
+
+```python
+model="openai/gpt-4o"
+model="deepseek/deepseek-chat"
+model="gemini/gemini-pro"
+```
+
+👉 同一套接口
+
+---
+
+### 但问题：
+
+❌ LiteLLM 统一的是 “messages”
+❌ 不是 block
+
+---
+
+# 5. 真正你想要的方案（关键）
+
+你要的是：
+
+> ✔ Anthropic block runtime + 多模型兼容
+
+👉 正确做法是：
+
+# 🧱 自己加一层 “Block Adapter Layer”
+
+---
+
+## ✔ 架构长这样：
+
+```text
+            ┌──────────────┐
+            │   LLM API    │
+            │ Claude/OpenAI│
+            └──────┬───────┘
+                   ↓
+        ┌────────────────────┐
+        │  Response Adapter   │
+        │ (convert to blocks) │
+        └────────────────────┘
+                   ↓
+        ┌────────────────────┐
+        │  Unified Blocks     │
+        │ Text / Tool / etc   │
+        └────────────────────┘
+                   ↓
+        ┌────────────────────┐
+        │   Agent Runtime     │
+        │ (你的 loop)        │
+        └────────────────────┘
+```
+
+---
+
+# 6. 关键设计：Adapter（核心）
+
+你要做的是：
+
+## ✔ OpenAI → Block
+
+```python
+def openai_to_blocks(resp):
+    return [
+        TextBlock(text=resp["choices"][0]["message"]["content"])
+    ]
+```
+
+---
+
+## ✔ DeepSeek → Block（因为它是 OpenAI 兼容）
+
+```python
+def deepseek_to_blocks(resp):
+    return openai_to_blocks(resp)
+```
+
+---
+
+## ✔ Anthropic → Block（原生）
+
+```python
+def anthropic_to_blocks(resp):
+    return resp.content
+```
+
+---
+
+# 7. 统一接口（你最终会得到）
+
+你 agent 只认：
+
+```python
+response.content  # 永远是 blocks
+```
+
+不管底层是谁。
+
+---
+
+# 8. 工程级标准方案（推荐组合）
+
+如果你想做“像 Claude Code 那种 agent”，最佳组合是：
+
+## ✔ 推荐 stack
+
+### 1️⃣ LiteLLM（统一 API）
+
+### 2️⃣ 自己写 Block Adapter（关键）
+
+### 3️⃣ agent loop（你现在这个）
+
+---
+
+# 9. 更高级方案（工业级）
+
+## ✔ LangGraph（更强）
+
+```python
+StateGraph(
+    nodes=[
+        llm_node,
+        tool_node,
+        router_node
+    ]
+)
+```
+
+👉 本质就是 block runtime 的升级版
+
+---
+
+# 10. 最关键的设计思想（一定要记住）
+
+你现在的问题本质不是 SDK，而是：
+
+> ❗ 你在做 “runtime design”，不是 “API call”
+
+---
+
+# 11. 一句话总结
+
+你想要的正确方案是：
+
+> ✔ 用 LiteLLM 统一模型调用
+> ✔ 自己做 “Block abstraction layer”
+> ✔ agent runtime 永远只处理 blocks
+
+---
+
+# 12. 如果你要下一步（我建议你做这个）
+
+我可以帮你直接升级成一个：
+
+## 🚀 “Multi-model Block Agent Framework”
+
+包含：
+
+* Claude block runtime
+* OpenAI/DeepSeek adapter
+* tool router
+* bash sandbox
+* memory
+* streaming
+
+只要你说一句：
+
+👉 **“给我做统一 block agent 架构”**
