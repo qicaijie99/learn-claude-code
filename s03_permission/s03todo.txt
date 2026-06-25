@@ -1,0 +1,122 @@
+闸门 1：一张硬拒绝表，先查，命中就返回阻止信息。（简单字符串匹配不是可靠安全机制，命令变体和 shell 展开可能绕过。
+
+向 CC 的做法学习并优化。）
+这种写法简单直接。
+
+但是问题是：
+
+input()
+
+会 阻塞整个程序。
+
+也就是说，程序停在那里，什么都不干，直到用户输入。
+
+对于你现在学习 Agent Loop，这种写法完全可以。
+
+3. 协程写法适合什么场景？
+
+协程适合这种情况：
+
+等待用户确认的时候，程序不想完全卡死
+
+比如：
+
+Agent 有流式输出
+前端页面通过按钮确认
+WebSocket 等待用户响应
+同时有多个 Agent 会话
+等待用户确认时还要处理其他事件
+工具调用本身是异步的，比如网络请求、文件上传、远程执行
+
+这时候用：
+
+async def ask_user_confirm(...):
+    ...
+
+会更合适。
+
+4. 一个简单协程版本
+
+终端里也可以写成异步形式：
+
+import asyncio
+
+async def ask_user_confirm(message: str) -> bool:
+    answer = await asyncio.to_thread(
+        input,
+        f"{message} Continue? [y/N]: "
+    )
+    return answer.lower() == "y"
+
+这里重点是：
+
+await asyncio.to_thread(input, ...)
+
+因为 input() 本身是阻塞函数，所以把它放到单独线程里执行，避免卡住整个事件循环。
+
+使用：
+
+async def main():
+    ok = await ask_user_confirm("Potentially destructive command")
+
+    if ok:
+        print("User approved")
+    else:
+        print("User denied")
+
+asyncio.run(main())
+5. 更像 Agent 的写法
+
+比如你有权限规则：
+
+PERMISSION_RULES = [
+    {
+        "tools": ["bash"],
+        "check": lambda args: any(
+            kw in args.get("command", "")
+            for kw in ["rm ", "> /etc/", "chmod 777"]
+        ),
+        "message": "Potentially destructive command"
+    }
+]
+
+可以写一个检查函数：
+
+def check_permission(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"]:
+            if rule["check"](args):
+                return rule["message"]
+    return None
+
+然后在 Agent Loop 里：
+
+async def maybe_confirm_tool_call(tool_name: str, args: dict) -> bool:
+    warning = check_permission(tool_name, args)
+
+    if warning is None:
+        return True
+
+    return await ask_user_confirm(warning)
+
+使用：
+
+async def agent_loop():
+    tool_name = "bash"
+    args = {"command": "rm test.txt"}
+
+    allowed = await maybe_confirm_tool_call(tool_name, args)
+
+    if not allowed:
+        print("Tool call cancelled")
+        return
+
+    print("Executing tool...")
+
+这样逻辑就变成：
+
+先检查权限
+如果安全，直接执行
+如果危险，await 等用户确认
+用户同意，再执行
+用户拒绝，取消
