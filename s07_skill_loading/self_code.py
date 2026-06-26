@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import yaml
 
 from pathlib import Path
 
@@ -18,13 +19,64 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = (
+SKILLS_DIR = WORKDIR / "skills"
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]: # 这种“固定数量、固定含义”的返回值，更适合用 tuple; 用[]类型注解
+    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    if not text.startswith("---"): # 检查TAML文件frontmatter的标准格式
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1]) or {} # meta = {"name": , "description": }
+    except yaml.YAMLError:
+        meta = {}
+    return meta, parts[2].strip()
+
+SKILL_REGISTRY: dict[str, dict] = {}
+
+def _scan_skills():
+    """Scan skills/ dir, populate SKILL_REGISTRY with name/description/content."""
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_dir(): # 跳过.../skills/ 里的非目录
+            continue
+        manifest = d / "SKILL.md"
+        if manifest.exists():
+            raw = manifest.read_text()
+            meta, body = _parse_frontmatter(raw)
+            name = meta.get("name", d.name) # d.name 是路径最后一级的名字
+            desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip()) # 默认"descption"，否则取清理后的第一行
+            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": body}    
+
+_scan_skills()
+
+def list_skills() -> str:
+    """List all skills (name + one-line description).""" # 格式化后交给SYSTEM
+    if not SKILL_REGISTRY:
+        return "# No skills found #"
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+
+def build_system() -> str:
+    """Build SYSTEM prompt with skill catalog injected at startup."""
+    catalog = list_skills()
+    return (
+       BASE_SYSTEM
+       + f"Skills available:\n{catalog}\n"
+       + f"Use load_skill to get full details when needed."
+    )
+
+BASE_SYSTEM = (
     f"You are a coding femboy engineer in {WORKDIR}. "
     #"Response with chiness language."
-    "Use bash to solve tasks. Act, don't explain, "
-    "Plan first, follow todo_list, then start multi-step task"
-    "say miao^_^ at last of your responses."
+    f"Use bash to solve tasks. Act, don't explain, "
+    f"Plan first, follow todo_list, then start multi-step task"
+    f"say miao^_^ at last of your responses."
 )
+
+SYSTEM = build_system()
 
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
@@ -104,6 +156,8 @@ TOOLS = [
          "required": ["todos"],
      },
     },
+    {"name": "load_skill", "description": "Load the full content of a skill by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 ]
 
 SUB_TOOLS = [
@@ -197,6 +251,13 @@ def run_glob(pattern: str) -> str:
         return "\n".join(results) if results else "(no matches)"
     except Exception as e:
         return f"Error: {e}"
+    
+def load_skill(name: str) -> str:
+    """Load full skill content. Lookup via registry — no path traversal."""
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
 
 CURRENT_TODOS: list[dict] = []
 def _normalize_todos(todos):
@@ -230,20 +291,6 @@ def sync_todo_list(todos: list) -> str:
         lines.append(f"  [{icon}] {t['content']}")
     print("\n".join(lines))
     return f"Update {len(CURRENT_TODOS)} tasks"
-
-
-TOOL_HANDLERS = {
-    "bash": run_bash,
-    "read_file": run_read,
-    "write_file": run_write,
-    "edit_file": run_edit,
-    "glob": run_glob,
-    "todo_list": sync_todo_list
-}
-SUB_TOOL_HANDLERS = {
-    "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
-}
 # # 第一层硬编码防御
 # DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/sda", "mkfs", "dd if=", "dd of="]
 # def check_deny_list(command: str) -> str | None:
@@ -421,7 +468,21 @@ def spawn_subagent(description: str) -> str:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
     return result  # only summary, entire message history discarded
-TOOL_HANDLERS["task"] = spawn_subagent  # 后续直接写进TOOL_HANDLERS里
+
+TOOL_HANDLERS = {
+    "task": spawn_subagent,
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
+    "todo_list": sync_todo_list,
+    "load_skill": load_skill,
+}
+SUB_TOOL_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
+}
 
 def agent_loop(message: list):
     rounds_since_todo = 0
