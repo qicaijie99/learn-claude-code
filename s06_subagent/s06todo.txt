@@ -1,0 +1,32 @@
+1. 仿照CC的设计思想：
+Normal Subagent	指定了 subagent_type（normal path）	全新 messages[]，只有 prompt
+Fork Subagent	没指定 subagent_type，fork gate 开启	通过 buildForkedMessages() 构造 cache-friendly 前缀，共享 prompt cache
+General-Purpose	没指定 subagent_type，fork gate 关闭	同 Normal
+
+2. Fork 模式：为了共享 Prompt Cache
+这是教学版没有的核心概念。Fork 模式（forkSubagent.ts:60-71）不创建全新上下文，而是通过 buildForkedMessages()（forkSubagent.ts:107-168）构造 cache-friendly 消息前缀，保留父 assistant message 并生成 placeholder tool results。目的不是隔离，而是让 Anthropic API 的 prompt cache 命中：父子 Agent 的 system prompt、tools、messages 前缀完全一致，API 端不需要重算。
+缓存命中的五个关键组件（forkedAgent.ts:57-68）：system prompt、tools、model、messages 前缀、thinking config，必须字节级一致。
+
+3. Context Isolation 的精确粒度
+createSubagentContext()（forkedAgent.ts:345-462）创建子 Agent 的 ToolUseContext：
+字段	行为
+abortController	新的 child controller，父 abort 向下传播
+setAppState	默认 no-op；但 sync agent 通过 shareSetAppState 共享（runAgent.ts:697-714）
+readFileState	从父克隆（避免重复读相同文件）
+queryTracking	新 chainId，depth = parentDepth + 1
+子 Agent 不是完全隔离的：文件读取状态是共享的。UI 和通知的隔离程度取决于执行路径（sync/async/fork/teammate 各不同）。
+
+四、递归 Fork 防护
+教学版用"子 Agent 不给 task 工具"表达递归保护。真实实现更精细：isInForkChild()（forkSubagent.ts:78-89）检查对话历史中是否有 FORK_BOILERPLATE_TAG，有就拒绝。但 constants/tools.ts:36-46 中 Agent 工具默认在所有 agent 的禁用集合里，USER_TYPE === 'ant' 时例外；forkSubagent.ts:73-89 针对 fork child 有专门的递归保护；agentToolUtils.ts:100-110 在 teammate 场景下有特殊放行。不是简单的"禁止新的子 Agent"。
+
+五、Permission Bubbling
+Fork Agent 的 permissionMode: 'bubble'（forkSubagent.ts:67）意味着子 Agent 的权限弹窗冒泡到父终端，用户在主终端里审批子 Agent 的操作。
+
+六、Async vs Sync
+教学版只展示了同步子 Agent（父等着子跑完）。CC 还支持异步路径（AgentTool.tsx:686-764）：run_in_background: true 时异步启动，返回 { status: 'async_launched' } 立即给父 Agent，子 Agent 完成后通过通知机制告知父 Agent。实际触发条件不止 run_in_background，还有 auto-background、assistant force async、coordinator/proactive 等路径。
+
+教学版的简化是刻意的
+三种模式 → 一种（fresh messages）：概念清晰
+Prompt cache 共享 → 省略：教学版不涉及 API 层优化
+递归 fork 防护 → 简化为"子 Agent 无 task 工具"
+Async → 省略（留给 s13）：s06 先理解同步模型

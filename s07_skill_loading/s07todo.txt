@@ -1,0 +1,20 @@
+一、技能来源：不是只有一个 skills/ 目录
+教学版假设所有技能在 skills/ 目录下。CC 实际从多个来源加载，分布在多个文件中：loadSkillsDir.ts 负责从 user/project/--add-dir 目录和 legacy commands（.claude/commands/）加载；bundledSkills.ts 负责内置技能；SkillTool.ts 处理 MCP 远程技能；commands.ts 负责命令聚合。类型包括 managed/policy skills、user skills（~/.claude/skills/）、project skills（.claude/skills/）、--add-dir skills、legacy commands、dynamic skills、conditional skills（带 paths frontmatter，按文件路径激活）、bundled skills、plugin skills、MCP skills。
+
+二、SKILL.md Frontmatter 常见字段
+CC 的 SKILL.md YAML frontmatter 由 parseSkillFrontmatterFields() 解析（loadSkillsDir.ts），常见字段包括：
+
+字段	用途
+name / description	显示名称和描述
+when_to_use	指导模型何时调用
+allowed-tools	技能可用工具的自动允许列表
+context	inline（默认）或 fork（作为子 Agent 运行）
+model	模型覆盖（haiku/sonnet/opus/inherit）
+hooks	技能级别的 hook 配置
+paths	条件激活的 glob 模式
+user-invocable	用户可以通过 /name 调用
+完整字段列表随版本迭代会变化，以上仅列出教学版涉及的核心字段。
+
+三、两级加载的精确实现
+Catalog（启动时）：getSkillDirCommands() 扫描目录 → 注册为 Command 对象，只包含元数据。getSkillListingAttachments() 把技能列表格式化为附件，预算为上下文窗口的 ~1%（上限 8000 字符）。
+Load（调用时）：模型调 Skill 工具（输入字段是 skill + 可选 args，教学版用 name）→ getPromptForCommand() 展开完整 SKILL.md 内容 → SkillTool 返回的 tool_result 展示文本只是 "Launching skill: {name}"，真正的技能内容通过 newMessages 注入对话。教学版把两者合并为"通过 tool_result 注入"是一种简化；加载后的 SKILL.md 仍可作为指引，帮助模型后续通过现有 file/bash 工具访问相关资源。
