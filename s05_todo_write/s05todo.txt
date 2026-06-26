@@ -1,0 +1,21 @@
+增幅规划功能
+
+CC 中有两套任务系统并存（tasks.ts:133-139）：
+
+TodoWrite（V1）：一个简单的列表工具，数据在内存 AppState 中维护（TodoWriteTool.ts:65-103）。教学版也保存在进程内存里，退出后清空
+Task System（V2 = s12）：文件持久化、依赖图、并发锁、ownership
+切换由 isTodoV2Enabled() 控制。当前源码的实现逻辑：交互式会话中 V2 默认启用，非交互式会话（SDK）中 V1 默认启用；设置 CLAUDE_CODE_ENABLE_TASKS 环境变量可强制启用 V2。注意源码注释 "Force-enable tasks in non-interactive mode" 描述的是 env var 路径的用途，和默认分支的返回值语义不同，阅读时需区分。
+
+教学版省略了真实源码中的 activeForm 字段（utils/todo/types.ts:8-15）。CC 用它给 UI spinner 展示"正在做什么"，教学版只有终端输出，不需要这个字段。
+
+教学版的 nag reminder（3 轮未更新就注入提醒）是教学机制。CC 源码中没有固定的"3 轮"逻辑，更接近的是 TodoWriteTool.ts:72-107 中当 3 个以上 todo 全部完成但没有 verification 项时，追加 verification nudge。
+
+Task System 相比 TodoWrite 的核心增量：
+
+文件持久化（Claude 配置目录下 tasks/{taskListId}/{taskId}.json）而非内存列表
+blockedBy 依赖图而非平铺列表
+proper-lockfile 并发安全而非无锁
+四个独立工具（Create/Get/Update/List）而非一个
+TaskCreated / TaskCompleted hooks（TaskCreateTool.ts:80-129、TaskUpdateTool.ts:231-260）供外部系统集成
+
+用户输入请求，大模型拿到message后第一次返回content,sync_todo_list被调用更新todo,然后跟着message再喂给大模型对吗，请梳理详细步骤，具体到调用函数
