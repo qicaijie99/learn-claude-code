@@ -1,0 +1,477 @@
+复刻CC中除了团队共享的 memory 设计
+subagent没有memory?
+
+
+七、pre_compress 快照有问题
+
+你写的是：
+
+pre_compress = [m if isinstance(m, dict) else {"role": m.get("role",""),
+    "content": str(m.get("content",""))} for m in message]
+
+这句有两个问题。
+
+问题 1：如果 m 不是 dict，却调用 m.get
+
+你写的是：
+
+m if isinstance(m, dict) else {"role": m.get("role",""), ...}
+
+如果 m 不是 dict，才会进入 else。
+
+但 else 里面又写了：
+
+m.get(...)
+
+如果 m 不是 dict，大概率没有 .get() 方法，就会报错。
+
+例如：
+
+m = "hello"
+m.get("role", "")
+
+会报：
+
+AttributeError: 'str' object has no attribute 'get'
+
+更合理写法：
+
+pre_compress = [
+    m.copy() if isinstance(m, dict)
+    else {"role": "", "content": str(m)}
+    for m in message
+]
+
+如果你想要真正快照，最好用：
+
+import copy
+pre_compress = copy.deepcopy(message)
+问题 2：它不是严格意义上的“完整快照”
+
+你现在每轮 while 顶部都会重新赋值：
+
+pre_compress = [...]
+
+最后 extract_memories(pre_compress) 用的是最后一轮 while 顶部的快照。
+
+但是这份快照：
+
+不包含本轮刚刚生成的最终 assistant response；
+可能已经经过前面几轮工具结果追加；
+如果前一轮已经发生过压缩，它也不一定是最原始的完整对话；
+如果压缩函数内部修改了 dict 对象，浅拷贝也不安全。
+
+所以这句注释：
+
+# s09: save pre-compression snapshot for accurate memory extraction
+
+表达的目标是对的，但实现不是很稳。
+
+更稳的思路是：在进入 while 之前保存本轮用户输入前后的完整快照，或者在每次压缩前保留一份深拷贝。
+
+例如：
+
+import copy
+
+last_full_snapshot = copy.deepcopy(message)
+
+while True:
+    pre_compress = copy.deepcopy(message)
+    last_full_snapshot = pre_compress
+    ...
+
+最后：
+
+extract_memories(last_full_snapshot)
+
+如果你希望包含最终 assistant 回答，则在 append assistant 后再做一次：
+
+final_snapshot = copy.deepcopy(message)
+extract_memories(final_snapshot)
+八、memory 注入位置也有隐患
+
+你现在的逻辑是：
+
+memory_turn = len(message) - 1 if message and isinstance(message[-1].get("content"), str) else None
+
+意思是：
+
+如果最后一条消息的 content 是字符串，就把 memory 注入到最后一条消息上。
+
+然后每轮请求前：
+
+request_messages[memory_turn] = {
+    **message[memory_turn],
+    "content": memories_content + "\n\n" + message[memory_turn]["content"],
+}
+
+这个设计在简单情况下可以，但有一个隐患：
+
+你的 message 会在 while 循环里不断被压缩、追加 assistant、追加 tool_result。原来的 memory_turn 索引可能不再指向原来的用户消息。
+
+尤其是这几行：
+
+message[:] = tool_result_budget(message)
+message[:] = snip_compact(message)
+message[:] = micro_compact(message)
+
+这些函数可能改变 message 列表长度或顺序。
+
+如果原来：
+
+memory_turn = 5
+
+压缩后第 5 条可能已经不是原来的用户输入。
+
+更稳的做法是：每次请求前动态找“最后一条 user 字符串消息”。
+
+例如：
+
+def inject_memories(messages: list, memories_content: str) -> list:
+    if not memories_content:
+        return messages
+
+    request_messages = messages.copy()
+
+    for i in range(len(request_messages) - 1, -1, -1):
+        msg = request_messages[i]
+        if msg.get("role") == "user" and isinstance(msg.get("content"), str):
+            request_messages[i] = {
+                **msg,
+                "content": memories_content + "\n\n" + msg["content"],
+            }
+            return request_messages
+
+    return messages
+
+然后请求前：
+
+request_messages = inject_memories(message, memories_content)
+
+这样不会依赖旧索引。
+
+九、for ... else 这里逻辑基本对，但容易误解
+
+你写的是：
+
+for block in response.content:
+    if block.type != "tool_use":
+        continue
+
+    ...
+
+    if block.name == "compact":
+        message[:] = compact_history(message)
+        results.append(...)
+        message.append({"role": "user", "content": results})
+        break
+
+    ...
+
+else:
+    message.append({"role": "user", "content": results})
+    continue
+
+Python 的 for ... else 含义是：
+
+如果 for 循环没有被 break 打断，就执行 else。
+
+所以这里的逻辑是：
+
+情况	是否执行 else
+普通工具执行完	执行 else，append results
+遇到 compact，执行 break	不执行 else
+response.content 里没有任何 tool_use	也会执行 else
+
+你的意图是：
+
+compact 分支自己已经 append 了 tool_result，所以不要再让 else 重复 append。
+
+这一点是对的。
+
+但是有一个隐患：
+
+如果 response.stop_reason 是 "tool_use"，但是 response.content 里面没有任何真正的 tool_use block，那么：
+
+results = []
+
+最后会执行：
+
+message.append({"role": "user", "content": results})
+
+也就是 append 一个空 tool_result 列表。
+
+这个可能导致下一轮 API 报错。
+
+更安全：
+
+if results:
+    message.append({"role": "user", "content": results})
+else:
+    message.append({
+        "role": "user",
+        "content": "Error: tool_use stop reason but no tool_use block found."
+    })
+continue
+
+不过正常情况下，stop_reason == "tool_use" 应该会有 tool_use block。
+
+十、unknown tool 分支有 bug
+
+你现在写：
+
+tool_handler = TOOL_HANDLERS.get(block.name)
+if not tool_handler:
+    print(f"Error: Unknown tool '{block.name}'")
+    continue
+
+问题是：如果 LLM 发出了一个 tool_use block，你必须给它返回对应的 tool_result。
+
+但这里遇到 unknown tool 时，你只是：
+
+continue
+
+没有给这个 tool_use_id 追加 tool_result。
+
+这会导致下一轮 messages 里出现：
+
+assistant: 我要调用 unknown_tool，tool_use_id=xxx
+user: 没有对应 tool_result
+
+很多模型 API 会直接报错，因为 tool_use 和 tool_result 必须配对。
+
+应该改成：
+
+tool_handler = TOOL_HANDLERS.get(block.name)
+if not tool_handler:
+    err = f"Error: Unknown tool '{block.name}'"
+    print(err)
+    results.append({
+        "type": "tool_result",
+        "tool_use_id": block.id,
+        "content": err,
+    })
+    continue
+
+这样即使工具不存在，也给 LLM 一个明确结果。
+
+十一、blocked 判断建议改成 is not None
+
+你写的是：
+
+blocked = trigger_hooks("PreToolUse", block)
+if blocked:
+    results.append(...)
+    continue
+
+这个逻辑大多数时候能跑。
+
+但如果 hook 返回的是空字符串：
+
+""
+
+或者返回：
+
+0
+False
+
+这些值虽然不是 None，但在 Python 里会被当成 False。
+
+如果你的 hook 约定是：
+
+只要返回不是 None，就表示拦截
+
+那这里应该写：
+
+if blocked is not None:
+
+更准确。
+
+十二、print(output[:200]) 可能报错
+
+你写：
+
+print(output[:200])
+
+如果工具返回字符串，没问题。
+
+但如果工具返回：
+
+dict
+list
+Path
+None
+
+就可能报错。
+
+比如：
+
+output = {"ok": True}
+output[:200]
+
+会报：
+
+TypeError: unhashable type: 'slice'
+
+你后面已经用了：
+
+"content": str(output)
+
+所以这里也建议改成：
+
+print(str(output)[:200])
+十三、工具执行没有异常保护
+
+你现在写：
+
+output = tool_handler(**block.input) if tool_handler else f"Unknown: {block.name}"
+
+如果工具函数内部报错，整个 agent_loop 会直接崩。
+
+例如：
+
+FileNotFoundError
+TypeError
+PermissionError
+
+更稳的写法：
+
+try:
+    output = tool_handler(**block.input)
+except Exception as e:
+    output = f"Error running tool {block.name}: {e}"
+
+然后仍然 append tool_result。
+
+十四、compact 工具分支有一个边界隐患
+
+你写：
+
+if block.name == "compact":
+    message[:] = compact_history(message)
+    results.append({"type": "tool_result", "tool_use_id": block.id,
+                    "content": "[Compacted. Conversation history has been summarized.]"})
+    message.append({"role": "user", "content": results})
+    break
+
+这表示：
+
+一旦遇到 compact，就压缩历史、返回 compact 的 tool_result，然后跳出当前 tool block 循环。
+
+如果这个 response 里只有一个 compact tool_use，没问题。
+
+但如果 response.content 里同时包含多个 tool_use，比如：
+
+compact
+read_file
+
+你只给 compact 返回了 tool_result，后面的 read_file 没处理。
+
+严格来说，这也会造成 tool_use / tool_result 不配对。
+
+不过如果你设计上规定：
+
+compact 工具必须单独调用，不能和其他工具并列。
+
+那可以接受。
+
+更稳的做法是在 prompt 或工具设计上强约束：
+
+If you call compact, call it alone.
+
+或者在代码里检测：
+
+tool_blocks = [b for b in response.content if b.type == "tool_use"]
+if any(b.name == "compact" for b in tool_blocks) and len(tool_blocks) > 1:
+    ...
+十五、messages=message 和 message.append(...) 会污染真实历史吗？
+
+你现在直接在原列表上做：
+
+message.append(...)
+message[:] = ...
+
+这是有意设计：
+
+让外部传入的 message 列表被原地更新。
+
+这没有错，但要清楚：
+
+message[:] = compact_history(message)
+
+和：
+
+message = compact_history(message)
+
+不同。
+
+message[:] = ... 是原地替换列表内容，外部引用也能看到变化。
+
+这是 agent_loop 常见写法。
+
+十六、目前最大的 5 个必须修的 bug
+
+按严重程度排序：
+
+1. messages 未定义
+
+错误代码：
+
+memory_turn < len(messages)
+
+改成：
+
+memory_turn < len(message)
+
+或者统一把参数改名为 messages。
+
+2. request_messages 没有传给 API
+
+错误代码：
+
+messages=message
+
+改成：
+
+messages=request_messages
+3. system 没有传给 API
+
+错误代码：
+
+system=SYSTEM
+
+改成：
+
+system=system
+4. rounds_since_todo 每轮被清零
+
+错误代码：
+
+if rounds_since_todo >= 3 and message:
+    ...
+rounds_since_todo = 0
+
+改成：
+
+if rounds_since_todo >= 3 and message:
+    ...
+    rounds_since_todo = 0
+5. unknown tool 没有返回 tool_result
+
+错误代码：
+
+if not tool_handler:
+    print(f"Error: Unknown tool '{block.name}'")
+    continue
+
+改成：
+
+if not tool_handler:
+    err = f"Error: Unknown tool '{block.name}'"
+    print(err)
+    results.append({
+        "type": "tool_result",
+        "tool_use_id": block.id,
+        "content": err,
+    })
+    continue
