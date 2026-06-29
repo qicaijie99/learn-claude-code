@@ -30,3 +30,5 @@ Fork Agent 的 permissionMode: 'bubble'（forkSubagent.ts:67）意味着子 Agen
 Prompt cache 共享 → 省略：教学版不涉及 API 层优化
 递归 fork 防护 → 简化为"子 Agent 无 task 工具"
 Async → 省略（留给 s13）：s06 先理解同步模型
+
+没有并发subagent功能
