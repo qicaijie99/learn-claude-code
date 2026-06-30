@@ -23,6 +23,102 @@ SKILLS_DIR = WORKDIR / "skills"
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
 TOOL_RESULTS_DIR = WORKDIR / ".task_outputs" / "tool-results"
 
+MEMORY_DIR = WORKDIR / ".memory"; MEMORY_DIR.mkdir(exist_ok=True)
+MEMORY_TYPES = ["user", "feedback", "project", "reference"]
+MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
+
+# ── Prompt Sections ──
+
+# s10改动：PROMPT_SECTIONS 只保存“稳定的静态片段”。
+# 动态信息（工具列表、workspace、memory）统一从 context 读取，避免 prompt 文本和真实运行状态不一致。
+PROMPT_SECTIONS = {
+    "identity": (
+        "You are a coding agent. Act, don't explain. "
+        "Your role-playing goal is a cat-eared femboy, and I am your supreme director. Say 'meow' at the end of your answers."
+        "Plan first for multi-step tasks, use tools when needed, and keep answers concise."
+    ),
+    "memory_policy": (
+        "Relevant memories are runtime context. Use them when relevant, "
+        "but never let memory override the current user request or system/tool safety rules."
+    ),
+}
+
+
+def assemble_system_prompt(context: dict) -> str:
+    """Select and join prompt sections based on the current context snapshot."""
+    sections = []
+
+    # s10改动：identity 是稳定 section，放在最前面，有利于本地缓存和 API prompt cache 的前缀稳定。
+    sections.append(PROMPT_SECTIONS["identity"])
+
+    # s10改动：workspace 不再用 PROMPT_SECTIONS 里的旧字符串，而是从 context 取实时状态。
+    sections.append(f"Working directory: {context.get('workspace', str(WORKDIR))}")
+
+    # s10改动：工具列表从 TOOL_HANDLERS 派生后放入 context，再由这里渲染；避免 system 说只有 read/write/bash，实际 tools 却更多。
+    enabled_tools = context.get("enabled_tools", [])
+    if enabled_tools:
+        sections.append("Available tools:\n" + "\n".join(f"- {name}" for name in enabled_tools))
+
+    # s10改动：skill catalog 也作为 context 的一部分注入，替代旧 build_system() 的硬编码路线。
+    skills = context.get("skills", "")
+    if skills:
+        sections.append("Skills available:\n" + skills + "\nUse load_skill to get full details when needed.")
+
+    # s10改动：memory_index 只作为目录提示，让模型知道有哪些记忆；真正相关正文放在 memories 里。
+    memory_index = context.get("memory_index", "")
+    if memory_index:
+        sections.append("Memory index:\n" + memory_index)
+
+    # s10改动：完整相关 memory 统一注入 system prompt，不再临时改写最新 user message。
+    memories = context.get("memories", "")
+    if memories:
+        sections.append(PROMPT_SECTIONS["memory_policy"] + "\n\nRelevant memories:\n" + memories)
+
+    return "\n\n".join(sections)
+
+_last_context_key = None
+_last_prompt = None
+
+def get_system_prompt(context: dict) -> str:
+    global _last_context_key, _last_prompt
+    key = json.dumps(context, ensure_ascii=False, sort_keys=True, default=str)
+    if key == _last_context_key and _last_prompt:  # 如果这次 context 没变，并且之前已经有缓存好的 prompt，就直接复用。
+        print("  \033[90m[cache hit] system prompt unchanged\033[0m")
+        return _last_prompt 
+    _last_context_key = key  # 如果上述二者有变化没有退出函数，则执行此处更新
+    _last_prompt = assemble_system_prompt(context)
+    # s10改动：日志展示实际注入的 section，方便观察 context 是否真正改变。
+    loaded = ["identity", "workspace", "tools"]
+    if context.get("skills"):
+        loaded.append("skills")
+    if context.get("memory_index"):
+        loaded.append("memory_index")
+    if context.get("memories"):
+        loaded.append("relevant_memories")
+    print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
+    return _last_prompt 
+
+# ── Context ──
+
+def update_context(context: dict, messages: list) -> dict:
+    """Derive a fresh context snapshot from real runtime state.
+
+    s10改动：context 是“状态快照”，不保存对话正文本身。
+    - memory_index：MEMORY.md 索引，给模型知道有哪些长期记忆。
+    - memories：根据最近 messages 选择出的完整相关 memory 正文。
+    - enabled_tools/workspace/skills：当前运行环境真实状态。
+    """
+    memory_index = read_memory_index()
+    relevant_memories = load_memories(messages) if messages else ""
+
+    return {
+        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "workspace": str(WORKDIR),
+        "skills": list_skills(),
+        "memory_index": memory_index,
+        "memories": relevant_memories,
+    }
+
 def _parse_frontmatter(text: str) -> tuple[dict, str]: # 这种“固定数量、固定含义”的返回值，更适合用 tuple; 用[]类型注解
     """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
     if not text.startswith("---"): # 检查TAML文件frontmatter的标准格式
@@ -35,6 +131,275 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]: # 这种“固定数量�
     except yaml.YAMLError:
         meta = {}
     return meta, parts[2].strip()
+
+def write_memory_file(name: str, mem_type: str, description: str, body: str):
+    """Write a single memory file with YAML frontmatter."""
+    slug = name.lower().replace(" ", "-").replace("/", "-")
+    filename = f"{slug}.md"
+    filepath = MEMORY_DIR / filename
+    filepath.write_text(
+        f"---\nname: {name}\ndescription: {description}\ntype: {mem_type}\n---\n\n{body}\n"
+    )
+    _rebuild_index()
+    return filepath
+
+def _rebuild_index():
+    """Rebuild MEMORY.md index from all memory files."""
+    lines = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta, body = _parse_frontmatter(raw)
+        name = meta.get("name", f.stem) # dict.get:如果字典里有这个 key就取对应值；如果没有就用默认值。此处意为：优先取 frontmatter 里的 name；如果没有就用文件名去掉后缀。
+        desc = meta.get("description", body.split("\n")[0][:80])
+        lines.append(f"- [{name}]({f.name}) — {desc}")
+    MEMORY_INDEX.write_text("\n".join(lines) + "\n" if lines else "")
+
+def read_memory_index() -> str:
+    """Read MEMORY.md index (injected into SYSTEM every turn)."""
+    if not MEMORY_INDEX.exists():
+        return ""
+    text = MEMORY_INDEX.read_text(encoding="utf-8", errors="replace").strip()
+    return text if text else ""
+
+def read_memory_file(filename: str) -> str | None:
+    """Read a single memory file's full content."""
+    path = MEMORY_DIR / filename
+    if not path.exists():
+        return None
+    return path.read_text()
+
+# 扫描所有 memory 文件，返回一个列表
+def list_memory_files() -> list[dict]:
+    """List all memory files with metadata."""
+    result = []
+    for f in sorted(MEMORY_DIR.glob("*.md")):
+        if f.name == "MEMORY.md":
+            continue
+        raw = f.read_text()
+        meta, body = _parse_frontmatter(raw)
+        result.append({
+            "filename": f.name,
+            "name": meta.get("name", f.stem),
+            "description": meta.get("description", ""),
+            "type": meta.get("type", "user"),
+            "body": body,
+        })
+    return result
+
+def select_relevant_memories(messages: list, max_items: int = 5) -> list[str]:
+    """Select relevant memory filenames by matching recent conversation against
+    memory names/descriptions. Uses a simple LLM call (or falls back to keyword
+    matching on name+description)."""
+    files = list_memory_files()
+    if not files:
+        return []
+     # Collect recent user text for context
+    recent_texts = []
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                for b in content:
+                    if getattr(b, "type", None) == "text": content = " ".join(str(getattr(b, "text", "")))
+            if isinstance(content, str): recent_texts.append(content)
+            if len(recent_texts) >= 3: break
+    recent = " ".join(reversed(recent_texts))[:2000]        
+                
+    if not recent.strip():
+        return []
+    
+    # Build catalog of name + description for LLM to choose from
+    catalog_lines = []
+    for i, f in enumerate(files):
+        catalog_lines.append(f"{i}: {f['name']} — {f['description']}")
+    catalog = "\n".join(catalog_lines)
+    prompt = (
+        "Given the recent conversation and the memory catalog below, "
+        "select the indices of memories that are clearly relevant. "
+        "Return ONLY a JSON array of integers, e.g. [0, 3]. "
+        "If none are relevant, return [].\n\n"
+        f"Recent conversation:\n{recent}\n\n"
+        f"Memory catalog:\n{catalog}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+        )
+        text = extract_text(response.content).strip()
+        # Extract JSON array from response
+        match = re.search(r'\[.*?\]', text, re.DOTALL)  # 抠出JSON array [..., ... ]
+        if match:
+            indices = json.loads(match.group())  # 把 JSON 格式的字符串，解析成 Python 对象。
+            selected = []
+            for idx in indices:
+                if isinstance(idx, int) and 0 <= idx <len(files):
+                    selected.append(files[idx]["filename"])
+                    if len(selected) >= max_items: break
+            return selected
+    except Exception as e:
+        print(f"[Memory selection failed] {e}")            
+
+    # Fallback: keyword matching on name + description
+    keywords = [w.lower() for w in recent.split() if len(w) > 3]  # 把最近对话按空格切词，只保留长度大于 3 的词，并转成小写。
+    selected = []
+    for f in files:
+        text = (f["name"] + " " + f["description"]).lower()
+        if any(kw in text for kw in keywords):
+            selected.append(f["filename"])
+            if len(selected) >= max_items:
+                break
+    return selected    
+
+# 选择相关 memory 文件，然后读取它们的完整内容，拼成一个字符串，准备注入上下文。
+def load_memories(messages: list) -> str:
+    """Load relevant memory content for injection into context."""
+    selected_files = select_relevant_memories(messages)
+    if not selected_files:
+        return ""
+
+    parts = ["<relevant_memories>"]
+    for filename in selected_files:
+        content = read_memory_file(filename)
+        if content:
+            parts.append(content)
+    parts.append("</relevant_memories>")
+    return "\n\n".join(parts)
+
+
+def extract_memories(messages: list):
+    """Extract new memories from recent dialogue. Runs after each turn."""
+    # Collect recent conversation text
+    dialogue_parts = []
+    for msg in messages[-10:]:
+        role = msg.get("role", "?")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                str(getattr(b, "text", "")) for b in content
+                if getattr(b, "type", None) == "text"
+            )
+        if isinstance(content, str) and content.strip():
+            dialogue_parts.append(f"{role}: {content}")
+    dialogue = "\n".join(dialogue_parts)
+
+    if not dialogue.strip():
+        return
+    
+    # Check existing memories to avoid duplicates(目的是避免重复写 memory。它是一种“用少量 token 换长期记忆质量”的设计。)
+    existing = list_memory_files()
+    existing_desc = "\n".join(f"- {m['name']}: {m['description']}" for m in existing) if existing else "(none)"
+
+    prompt = (
+        "Extract user preferences, constraints, or project facts from this dialogue.\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n"
+        "- name: short kebab-case identifier (e.g. 'user-preference-tabs')\n"
+        "- type: one of 'user' (user preference), 'feedback' (guidance), "
+        "'project' (project fact), 'reference' (external pointer)\n"
+        "- description: one-line summary for index lookup\n"
+        "- body: full detail in markdown\n"
+        "If nothing new or already covered by existing memories, return [].\n\n"
+        f"Existing memories:\n{existing_desc}\n\n"
+        f"Dialogue:\n{dialogue[:4000]}"
+    )
+
+    try:
+        response = client.messages.create(
+            model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=800
+        )
+        text = extract_text(response.content).strip()
+        # Extract JSON array from response
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+        if not items:
+            return
+        count = 0
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name, mem_type, desc, body)
+                count += 1
+        if count:
+            print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
+    except Exception as e:
+        print(f"[Memory extraction failed] {e}")
+
+CONSOLIDATE_THRESHOLD = 10
+
+def consolidate_memories():
+    """Merge duplicate/stale memories. Triggered when file count ≥ threshold."""
+    files = list_memory_files()
+    if len(files) < CONSOLIDATE_THRESHOLD:
+        return
+
+    catalog = "\n\n".join(
+        f"## {f['filename']}\nname: {f['name']}\ndescription: {f['description']}\n{f['body']}"
+        for f in files
+    )
+
+    # 合并重复记忆；
+    # 删除过时或被新信息否定的记忆；
+    # 总数控制在 30 条以内；
+    # 优先保留重要用户偏好。
+    prompt = (
+        "Consolidate the following memory files. Rules:\n"
+        "1. Merge duplicates into one\n"
+        "2. Remove outdated/contradicted memories\n"
+        "3. Keep the total under 30 memories\n"
+        "4. Preserve important user preferences above all\n"
+        "Return a JSON array. Each item: {name, type, description, body}.\n\n"
+        f"{catalog[:16000]}"
+    )
+    try:
+        response = client.messages.create(
+            model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=3000
+        )
+        text = extract_text(response.content).strip()
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if not match:
+            return
+        items = json.loads(match.group())
+
+        # Remove old memory files (keep MEMORY.md)
+        for f in MEMORY_DIR.glob("*.md"):
+            if f.name != "MEMORY.md":
+                f.unlink()
+        for mem in items:
+            name = mem.get("name", f"memory_{int(time.time())}")
+            mem_type = mem.get("type", "user")
+            desc = mem.get("description", "")
+            body = mem.get("body", "")
+            if desc and body:
+                write_memory_file(name, mem_type, desc, body) #  内部调用 _rebuild
+            print(f"\n\033[33m[Memory: consolidated {len(files)} → {len(items)} memories]\033[0m")
+    except Exception as e:
+        print(f"[Memory consolidation failed] {e}")
+
+
+# # Build SYSTEM with memory index（构造系统提示词，把 memory 索引塞进 SYSTEM。）
+# def build_system() -> str:
+#     """Build SYSTEM prompt with skill catalog injected at startup."""
+#     catalog = list_skills()
+#     index = read_memory_index()
+#     memories_section = f"\n\nMemories available:\n{index}" if index else ""
+#     return (
+#         BASE_SYSTEM
+#         + f"Skills available:\n{catalog}\n"
+#         + f"Use load_skill to get full details when needed."
+#         + f"You are a coding agent at {WORKDIR}."
+#         + f"{memories_section}\n"
+#         + "Relevant memories are injected below. Respect user preferences from memory.\n"
+#         + "When the user says 'remember' or expresses a clear preference, extract it as a memory."
+#     )
 
 SKILL_REGISTRY: dict[str, dict] = {}
 
@@ -59,26 +424,16 @@ def list_skills() -> str:
     """List all skills (name + one-line description).""" # 格式化后交给SYSTEM
     if not SKILL_REGISTRY:
         return "# No skills found #"
-    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())   
 
-def build_system() -> str:
-    """Build SYSTEM prompt with skill catalog injected at startup."""
-    catalog = list_skills()
-    return (
-       BASE_SYSTEM
-       + f"Skills available:\n{catalog}\n"
-       + f"Use load_skill to get full details when needed."
-    )
-
-BASE_SYSTEM = (
-    f"You are a coding femboy engineer in {WORKDIR}. "
-    #"Response with chiness language."
-    f"Use bash to solve tasks. Act, don't explain, "
-    f"Plan first, follow todo_list, then start multi-step task"
-    f"say miao^_^ at last of your responses."
-)
-
-SYSTEM = build_system()
+# BASE_SYSTEM = (
+#     f"You are a coding femboy engineer in {WORKDIR}. "
+#     #"Response with chiness language."
+#     f"Use bash to solve tasks. Act, don't explain, "
+#     f"Plan first, follow todo_list, then start multi-step task"
+#     f"say miao^_^ at last of your responses."
+# )
+# SYSTEM = build_system()
 
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
@@ -391,7 +746,8 @@ def spawn_subagent(description: str) -> str:
     """Spawn a subagent with fresh messages[], return summary only."""
     print(f"\n\033[35m[Subagent spawned]\033[0m")
     messages = [{"role": "user", "content": description}]  # fresh context
-    # 基本逻辑复用主agent循环
+    results = []  # s10改动：提前初始化，避免子 agent 第一次就自然语言结束时 results 未定义。
+
     for _ in range(30):  # safety limit
         response = client.messages.create(
             model=MODEL, system=SUB_SYSTEM,
@@ -400,39 +756,38 @@ def spawn_subagent(description: str) -> str:
         messages.append({"role": "assistant", "content": response.content})
         if response.stop_reason != "tool_use":
             break
+
         results = []
         for block in response.content:
-            if block.type == "tool_use":
-                # Issue 1: subagent also runs hooks (permissions apply)
-                blocked = trigger_hooks("PreToolUse", block)
-                if blocked:
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": str(blocked)})
-                    continue
-                handler = SUB_TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}" # 这里的 **block.input 会把 block.input 这个 dict 展开成关键字实参（格式是“形参 = 实参”），然后 Python 会按照函数定义里的形参名去匹配。
-                trigger_hooks("PostToolUse", block, output)
-                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+            if block.type != "tool_use":
+                continue
+            blocked = trigger_hooks("PreToolUse", block)
+            if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
+                                "content": str(blocked)})
+                continue
+            handler = SUB_TOOL_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+            trigger_hooks("PostToolUse", block, output)
+            print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": str(output)})
         messages.append({"role": "user", "content": results})
 
-    result = extract_text(messages[-1]["content"]) # 取messages里最后一项字典的content字段，存进result，用于返回主agent
-    if not results: # 空字符串时触发
-        # last message is tool_result, look backwards for assistant text
-        for msg in reversed(messages): # 迭代器反向遍历messages,找到执行失败的工具
-            if msg["role"] == "assistant": # 找LLM的自然语言部分
-                result = extract_text(msg["content"])
+    result = extract_text(messages[-1]["content"])
+    if not result:
+        # s10改动：优先回退查找最后一条 assistant 自然语言，避免把最后的 tool_result 当最终答案。
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant":
+                result = extract_text(msg.get("content", ""))
                 if result:
                     break
         if not result:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
-    return result  # only summary, entire message history discarded
+    return result
 
-CONTEXT_LIMIT = 50000
-KEEP_RECENT = 3
-PERSIST_THRESHOLD = 30000
+CONTEXT_LIMIT = 50000; KEEP_RECENT = 3; PERSIST_THRESHOLD = 30000
 def estimate_size(msgs): return len(str(msgs))
 
 def _block_type(block):
@@ -581,100 +936,140 @@ SUB_TOOL_HANDLERS = {
 
 MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 
-def agent_loop(message: list):
+def agent_loop(message: list, context: dict):
+    """Main agent loop.
+
+    s10改动：
+    1. 每轮入口先刷新 context，再组装 system prompt。
+    2. memory 只通过 context -> system prompt 注入，不再改写 user message。
+    3. tool_use / tool_result 配对完成后再 compact，避免协议断裂。
+    """
     rounds_since_todo = 0
     reactive_retries = 0
+
+    # s10改动：即使调用方传入旧 context，这里也会基于当前 message 重新派生一次。
+    context = update_context(context, message)
+    system = get_system_prompt(context)
+
     while True:
+        # s09/s10：保存压缩前快照，用于结束时做 memory extraction，减少压缩造成的信息丢失。
+        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role", ""),
+            "content": str(m.get("content", ""))} for m in message]
         # s08 change: three preprocessors (0 API calls, cheap first)
-        # Order matches CC source: budget → snip → micro
-        message[:] = tool_result_budget(message)    # L3: persist large results first
-        message[:] = snip_compact(message)          # L1: trim middle
-        message[:] = micro_compact(message)         # L2: old result placeholders
+        message[:] = tool_result_budget(message)  # L3: persist large results first
+        message[:] = snip_compact(message)        # L1: trim middle
+        message[:] = micro_compact(message)       # L2: old result placeholders
 
         # s08 change: tokens still over threshold → LLM summary (1 API call)
         if estimate_size(message) > CONTEXT_LIMIT:
             print("[auto compact]")
             message[:] = compact_history(message)
-        # 最初交给LLM的消息是用户输入的query以及下列基本信息，之后每次循环都会把上一次的response作为新的message传给LLM
+            # s10改动：压缩改变了 messages，需要刷新 context 和 system。
+            context = update_context(context, message)
+            system = get_system_prompt(context)
+
         if rounds_since_todo >= 3 and message:
-            message.append({"role": "user",
-                             "content": "<reminder>Update your todos.</reminder>"})
-        rounds_since_todo = 0
+            message.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
+            rounds_since_todo = 0
+            # s10改动：追加 reminder 后刷新 context，避免 memory selection 仍基于旧 messages。
+            context = update_context(context, message)
+            system = get_system_prompt(context)
 
         try:
+            # s10改动：不再构造 request_messages，也不再把 memory 拼进最新 user.content。
+            # messages 保持真实对话历史；runtime 状态全部走 system prompt。
             response = client.messages.create(
                 model=MODEL,
-                system=SYSTEM,
+                system=system,
                 messages=message,
                 tools=TOOLS,
                 max_tokens=8000,
             )
-            reactive_retries = 0  # reset on successful API call
-        
+            reactive_retries = 0
         except Exception as e:
             if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
                 print("[reactive compact]")
                 message[:] = reactive_compact(message)
                 reactive_retries += 1
+                context = update_context(context, message)  # s10改动：reactive compact 后 system 也要重组。
+                system = get_system_prompt(context)
                 continue
             raise
 
         message.append({"role": "assistant", "content": response.content})
+
         if response.stop_reason != "tool_use":
-        #     force = trigger_hooks("Stop", message)
-        #     if force is not None:
-        #         message.append({"role": "user", "content": force}) # 比assistant符合逻辑
-        #         continue # 再次while true， 当前无触发此处的逻辑
+            # s10改动：Stop hook 保留；如果 hook 返回内容，则作为 user 消息继续循环。
+            force = trigger_hooks("Stop", message)
+            if force is not None:
+                message.append({"role": "user", "content": str(force)})
+                context = update_context(context, message)
+                system = get_system_prompt(context)
+                continue
+
+            # s10改动：memory extraction 使用“压缩前快照 + 最终 assistant 回复”，避免漏掉最终结论。
+            extraction_source = pre_compress + [{"role": "assistant", "content": response.content}]
+            extract_memories(extraction_source)
+            consolidate_memories()
             return
-        
+
         rounds_since_todo += 1
         results = []
-        # 跳过text block
+        compact_after_tool_round = False  # s10改动：compact 只做标记，先保证 tool_use/tool_result 配对完整。
+
         for block in response.content:
             if block.type != "tool_use":
                 continue
             print(f"\033[36m> {block.name}\033[0m")
-            # s08: compact tool triggers compact_history, not a no-op string
+
             if block.name == "compact":
-                message[:] = compact_history(message)
+                compact_after_tool_round = True
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": "[Compacted. Conversation history has been summarized.]"})
-                message.append({"role": "user", "content": results})
-                break  # end current turn, start fresh with compacted context
+                                "content": "[Compact scheduled after this tool round.]"})
+                continue
 
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": str(blocked)})
+                                "content": str(blocked)})
                 continue
+
             tool_handler = TOOL_HANDLERS.get(block.name)
             if not tool_handler:
-                print(f"Error: Unknown tool '{block.name}'")
+                # s10改动：未知工具也要返回 tool_result，否则 API 会看到未配对的 tool_use。
+                output = f"Unknown tool: {block.name}"
+                print(output)
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": output})
                 continue
+
             print(f"\033[33m$ {block.input}\033[0m")
-            output = tool_handler(**block.input) if tool_handler else f"Unknown: {block.name}"
+            output = tool_handler(**block.input)
             trigger_hooks("PostToolUse", block, output)
             if block.name == "todo_list":
                 rounds_since_todo = 0
-            print(output[:200])
-            results.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": str(output),
-                }
-            )
-        else: # 防止和上下文压缩的results写入重复
-            message.append({"role": "user", "content": results})
-            continue
+            print(str(output)[:200])
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": str(output)})
 
+        message.append({"role": "user", "content": results})
+
+        if compact_after_tool_round:
+            # s10改动：现在 assistant tool_use 和 user tool_result 已经配对，可以安全压缩整段历史为普通 user summary。
+            message[:] = compact_history(message)
+
+        # s10改动：每个工具轮结束后重新派生 context；memory 文件、workspace、工具状态变化都能反映到 system prompt。
+        context = update_context(context, message)
+        system = get_system_prompt(context)
+        continue
 
 
 if __name__ == "__main__":
-    print("s02_test_agent_loop")
+    print("s10_optimized_agent_loop")
     print("Enter a question and press Enter to send. Type exit to quit.\n")
 
     history = []
+    context = update_context({}, [])
     while True:
         try:
             query = input(">>> ")
@@ -682,12 +1077,22 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in {"exit", "q"}:
             break
+
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        response = history[-1]["content"]
+
+        # s10改动：先把最新用户输入纳入 context，再进入 agent_loop。
+        context = update_context(context, history)
+        agent_loop(history, context)
+
+        # s10改动：agent_loop 结束后可能写入了新 memory，因此再刷新一次，供下一轮使用。
+        context = update_context(context, history)
+
+        response = history[-1].get("content", "")
         if isinstance(response, list):
             for block in response:
                 if getattr(block, "type", None) == "text":
                     print(block.text)
+        elif isinstance(response, str):
+            print(response)
         print()
