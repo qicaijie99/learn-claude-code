@@ -1,0 +1,74 @@
+路径 2: 上下文超限
+LLM 说"你的上下文太长了"（ prompt_too_long ）。s08 的四层压缩全跑过了，还是超。
+触发 reactive compact——比 auto compact 更激进。教学版只保留最后 5 条消息模拟压缩效果；真实实现会调用 LLM 生成 compact 摘要再重试。压缩后重试。但如果压缩过一次还是超限，只能退出——再压缩也不会变小：
+
+
+已完成：
+reactive compact 的摘要 API 失败会直接逃出 `agent_loop`，导致程序崩溃？
+
+会，你的判断对。我们顺着调用链把崩溃路径走一遍，确认它确实会逃出 `agent_loop`，再说它属于哪种性质。
+
+**崩溃路径**：`agent_loop` 的 except 分支里调 `reactive_compact(message)` → 它内部调 `summarize_history(...)` → 里面有一句**没有任何 try/except 包裹**的 API 调用：
+
+```python
+def summarize_history(messages):
+    ...
+    response = client.messages.create(model=MODEL, messages=[...], max_tokens=2000)   # ← 裸调用，没兜
+    return "\n".join(...) or "(empty summary)"
+```
+
+这句一旦抛异常（网络断、限流、超时、余额不足、prompt 又太长，等等），异常会从 `summarize_history` 抛出 → 穿过 `reactive_compact`（也没兜）→ 回到 `agent_loop` 那一句 `message[:] = reactive_compact(message)`。
+
+关键点在这里：**这句赋值是在 `except Exception as e:` 块体的内部。** 而 Python 的 `except` 块**只捕获它对应的 `try` 块里抛出的异常，不捕获 `except` 块体自己执行时新抛出的异常**。所以这个新异常不会被同一个 `except` 接住——它直接往上逃，逃出 `agent_loop`。
+
+再往上看 `__main__`：
+
+```python
+agent_loop(history, context)        # ← 这里也没有 try/except 包着
+```
+
+调用 `agent_loop` 的地方同样裸着。于是异常继续逃，一路冒泡到顶层，**整个程序带 traceback 崩掉**，连同你这一整轮会话的进程都没了。
+
+所以完整答案是：**会崩，而且不只是退出当前这轮 `agent_loop`，是整个进程挂掉。** 根因是 `summarize_history` 里那句 `client.messages.create` 是裸调用——它既没包 `with_retry`，也没自己的 try/except。
+
+值得注意的对比：你主循环里那句 LLM 调用是用 `with_retry(...)` 包了的，还套了外层 except 做兜底；但 reactive_compact 这条**恢复路径**上的 LLM 调用反而是裸的。这有点讽刺——**正是在"主调用已经因为 prompt_too_long 失败、最需要稳妥"的当口，你的恢复代码自己又发了一个不设防的 API 请求**。恢复逻辑比主逻辑更脆，这通常不是想要的。同样的裸调用问题，`extract_memories`、`consolidate_memories`、`select_relevant_memories`、`spawn_subagent` 里那几处 `client.messages.create` 也都有——它们各自被一个 try/except 罩着（除了 `spawn_subagent` 内部那个），所以不会崩进程，但 `summarize_history` 这条是真能崩的。
+
+不过在动手加 try/except 之前，提醒一下你的仓库 rule 2：这是**教学仓库**，"某处像 bug 的简化往往是刻意的，先在 issue 里问一声"。`summarize_history` 不兜异常，很可能是本章为了让 compact 主线清晰而**刻意省掉的错误处理层**——rule 2 还特意点了"不要加生产级的错误处理层，除非这一章本身在讲这个"。本章讲的是"调用错误处理"，那么"恢复路径自身的调用也要设防"算不算本章范畴，是个真问题，值得先问作者，而不是默认它是 bug 直接改。
+
+如果确认要修，最小改法是给 `summarize_history` 那句套个 try/except，失败时返回一个降级摘要而不是抛出，让 `reactive_compact` 至少能产出点东西、`agent_loop` 不至于崩：
+
+```python
+def summarize_history(messages):
+    conversation = json.dumps(messages, default=str)[:80000]
+    prompt = (...)
+    try:
+        response = client.messages.create(model=MODEL, messages=[{"role": "user", "content": prompt}], max_tokens=2000)
+    except Exception as e:
+        print(f"  \033[31m[summarize failed] {type(e).__name__}: {e}\033[0m")
+        return "(summary unavailable — summarization call failed)"   # 降级，不抛
+    return "\n".join(
+        getattr(block, "text", "")
+        for block in response.content
+        if getattr(block, "type", None) == "text").strip() or "(empty summary)"
+```
+
+但这又会引出一个设计问题，跟你前两条聊的 reactive_retries 守卫相关：如果摘要失败返回的是降级占位串，`reactive_compact` 压缩后 prompt 大概率**还是太长**，于是下一轮又触发 prompt_too_long……这时候就全靠你那个守卫（`reactive_retries < MAX_REACTIVE_RETRIES`，前提是你按上一条接对了线）来兜底，让它试够次数后走 `[unrecoverable]` 干净退出，而不是无限转。所以这两处其实要配合着看：**裸调用导致"硬崩"，守卫失效导致"软循环"**，两个都修好，这条恢复路径才算稳。
+
+要不要我把"`summarize_history` 裸 API 调用会让 reactive compact 失败时崩溃整个进程"这条按你仓库格式整理成 issue？记得它和之前的 model 冻结、reactive_retries 守卫是三个独立问题，按 rule 1 该分开提。
+
+2.防止 reactive compact 失败导致程序崩溃
+修改 [self_code.py (line 977)](G:/agentLn_ws/learn-claude-code/s11_error_recovery/self_code.py:977)，让摘要请求也走 with_retry：
+
+3. 429 时清零连续 529 计数
+在 [self_code.py (line 787)](G:/agentLn_ws/learn-claude-code/s11_error_recovery/self_code.py:787) 的 429 分支中加入：
+if "ratelimit" in name.lower() or "429" in msg:
+    # 429 打断了连续 529 序列
+    state.consecutive_529 = 0
+
+    delay = retry_delay(attempt, get_retry_after(e))
+    print(
+        f"  \033[33m[429 rate limit] retry "
+        f"{attempt + 1}/{MAX_RETRIES}, wait {delay:.1f}s\033[0m"
+    )
+    time.sleep(delay)
+    continue
