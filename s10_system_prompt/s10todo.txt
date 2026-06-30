@@ -1,0 +1,7 @@
+数量不固定，受 feature flag、output style、KAIROS/Proactive 模式、用户类型、token 预算等影响。大致分两类：
+
+静态 section（始终加载）：identity、system、doing_tasks、actions、using_tools、tone_style、output_efficiency 等。
+
+动态 section（按状态加载）：session_guidance、memory、ant_model_override、env_info_simple、language、output_style、mcp_instructions、scratchpad、frc、summarize_tool_results、numeric_length_anchors、token_budget、brief 等。
+
+mcp_instructions 是唯一的易失性 section（通过 DANGEROUS_uncachedSystemPromptSection() 创建），因为 MCP server 可以在轮次间连接和断开。
