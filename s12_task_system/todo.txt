@@ -1,1 +1,7 @@
 盖房子不能先盖屋顶再打地基。任务之间有先后。任务依赖应该形成有向无环图（DAG）；教学版只演示 blockedBy 检查，没有实现环检测。
+
+教学代码保留基础 agent loop，为聚焦任务系统省略了 S11 的完整错误恢复（RecoveryState、退避、升级、reactive compact、fallback model）。新增 5 个任务工具 + .tasks/ 目录持久化 + blockedBy 依赖检查。任务系统与错误恢复是独立层：CC 源码中 utils/tasks.ts 只管 CRUD，query.ts 的 with_retry/RecoveryState 管错误恢复，互不耦合。
+
+仿照 CC 将 task 系统拆分成多模块，
+
+subagent 接入 task 系统  
