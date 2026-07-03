@@ -1,4 +1,5 @@
 import ast
+from datetime import datetime
 from importlib.resources import path
 import json
 import os
@@ -655,6 +656,28 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
+    {"name": "schedule_cron",
+     "description": "Schedule a cron job. cron is 5-field: min hour dom month dow.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "cron": {"type": "string",
+                                   "description": "5-field cron expression"},
+                          "prompt": {"type": "string",
+                                     "description": "Message to inject when fired"},
+                          "recurring": {"type": "boolean",
+                                        "description": "True=recurring, False=one-shot"},
+                          "durable": {"type": "boolean",
+                                      "description": "True=persist to disk"}},
+                      "required": ["cron", "prompt"]}},
+    {"name": "list_crons",
+     "description": "List all registered cron jobs.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "cancel_cron",
+     "description": "Cancel a cron job by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"job_id": {"type": "string"}},
+                      "required": ["job_id"]}},
 ]
 
 SUB_TOOLS = [
@@ -790,6 +813,31 @@ def run_claim_task(task_id: str) -> str:
 
 def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
+
+def run_schedule_cron(cron: str, prompt: str,
+                      recurring: bool = True, durable: bool = True) -> str:
+    result = schedule_job(cron, prompt, recurring, durable)
+    if isinstance(result, str):
+        return f"Error: {result}"
+    return f"Scheduled {result.id}: '{cron}' → {prompt}"
+
+
+def run_list_crons() -> str:
+    with cron_lock:
+        jobs = list(scheduled_jobs.values())
+    if not jobs:
+        return "No cron jobs. Use schedule_cron to add one."
+    lines = []
+    for j in jobs:
+        tag = "recurring" if j.recurring else "one-shot"
+        dur = "durable" if j.durable else "session"
+        lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
+                     f"[{tag}, {dur}]")
+    return "\n".join(lines)
+
+
+def run_cancel_cron(job_id: str) -> str:
+    return cancel_job(job_id)
 
 CURRENT_TODOS: list[dict] = []
 def _normalize_todos(todos):
@@ -1183,6 +1231,8 @@ TOOL_HANDLERS = {
     "create_task": run_create_task, "list_tasks": run_list_tasks,
     "get_task": run_get_task, "claim_task": run_claim_task,
     "complete_task": run_complete_task,
+    "schedule_cron": run_schedule_cron, "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
 }
 SUB_TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
@@ -1264,6 +1314,237 @@ def collect_background_results() -> list[str]:
               f"{task['command'][:40]} ({len(output)} chars)\033[0m")
     return notifications
 
+# ── Cron Scheduler (s14 new) ──
+
+DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
+
+@dataclass
+class CronJob:
+    id: str
+    cron: str        # "0 9 * * *"
+    prompt: str      # message to inject when fired
+    recurring: bool  # True = recurring, False = one-shot
+    durable: bool    # True = persist to disk
+
+scheduled_jobs: dict[str, CronJob] = {}
+cron_queue: list[CronJob] = []
+cron_lock = threading.Lock()
+agent_lock = threading.Lock()
+_last_fired: dict[str, str] = {}  # job_id → "YYYY-MM-DD HH:MM"
+
+def _cron_field_matches(field: str, value: int) -> bool:  # 例如_cron_field_matches("*/5", 5)   # 判断分钟字段是否匹配
+    """Check if a single cron field matches a value."""
+    if "," in field:
+        return any(_cron_field_matches(f.strip(), value)
+                   for f in field.split(","))
+    # 每隔 n 个单位匹配一次
+    if field.startswith("*/"):
+        try:
+            n = int(field[2:])
+            return n > 0 and value % n == 0
+        except ValueError: return False
+    if field == "*": return True
+    if "-" in field: 
+        try:
+            start, end = map(int, field.split("-")) #  map(int, ...)：将该int()函数应用于列表中的每个项目，将它们从字符串数据类型更改为整数数据类型。
+            return start <= value <= end
+        except ValueError: return False
+    return str(value) == field
+
+def cron_matches(cron_expr: str, dt: datetime) -> bool:
+    """Check if a 5-field cron expression matches the given datetime.
+    Standard cron semantics: DOM and DOW use OR when both are constrained."""
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return False
+    minute, hour, dom, month, dow = fields
+    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
+
+    m = _cron_field_matches(minute, dt.minute)
+    h = _cron_field_matches(hour, dt.hour)
+    dom_ok = _cron_field_matches(dom, dt.day)
+    month_ok = _cron_field_matches(month, dt.month)
+    dow_ok = _cron_field_matches(dow, dow_val)
+
+    # Minute, hour, month must all match
+    if not (m and h and month_ok):
+        return False
+    # DOM and DOW: if both constrained, either matching is enough (OR)
+    dom_unconstrained = dom == "*"
+    dow_unconstrained = dow == "*"
+    if dom_unconstrained and dow_unconstrained:
+        return True
+    if dom_unconstrained:
+        return dow_ok
+    if dow_unconstrained:
+        return dom_ok
+    return dom_ok or dow_ok
+
+def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
+    if "," in field:
+        for part in field.split(","):
+            error = _validate_cron_field(part.strip(), lo, hi)
+            if error:
+                return error
+        return None
+    if field == "*":
+        return None
+    if field.startswith("*/"):
+        step = field[2:]
+        if not step.isdigit():
+            return f"invalid step '{field}'"
+        if int(step) <= 0:
+            return f"step must be greater than zero: '{field}'"
+        return None
+    if "-" in field:
+        parts = field.split("-", 1)
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            return f"invalid range '{field}'"
+        start, end = map(int, parts)
+        if not (lo <= start <= end <= hi):
+            return f"range '{field}' outside [{lo}, {hi}]"
+        return None
+    if not field.isdigit():
+        return f"invalid value '{field}'"
+    value = int(field)
+    if not lo <= value <= hi:
+        return f"value {value} outside [{lo}, {hi}]"
+    return None
+
+def validate_cron(cron_expr: str) -> str | None:
+    """Validate a cron expression. Returns error message or None."""
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return f"Expected 5 fields, got {len(fields)}"
+    bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+    names = ["minute", "hour", "day-of-month", "month", "day-of-week"]
+    for i, (field, (start, end), name) in enumerate(zip(fields, bounds, names)):
+        err = _validate_cron_field(field, start, end)
+        if err:
+            return f"{name}: {err}"
+    return None
+
+
+def save_durable_jobs():
+    """Persist durable jobs to .scheduled_tasks.json."""
+    with cron_lock:
+        payload = [
+            asdict(job) for job in scheduled_jobs.values()
+            if job.durable
+        ]
+    temp_path = DURABLE_PATH.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, DURABLE_PATH)
+
+def load_durable_jobs():
+    """Load durable jobs from disk on startup."""
+    if not DURABLE_PATH.exists():
+        return
+    try:
+        jobs = json.loads(DURABLE_PATH.read_text())
+        for j in jobs:
+            job = CronJob(**j)
+            err = validate_cron(job.cron)
+            if err:
+                print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
+                continue
+            scheduled_jobs[job.id] = job
+        valid = [j for j in jobs if j["id"] in scheduled_jobs]
+        if valid:
+            print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
+    except Exception:
+        pass
+
+def schedule_job(cron: str, prompt: str, recurring: bool = True,
+                 durable: bool = True) -> CronJob | str:
+    """Register a new cron job. Returns CronJob or error string."""
+    err = validate_cron(cron)
+    if err:
+        return err
+    job = CronJob(  # 创建一个新job对象
+        id=f"cron_{random.randint(0, 999999):06d}",
+        cron=cron, prompt=prompt,
+        recurring=recurring, durable=durable,
+    )
+    with cron_lock:
+        scheduled_jobs[job.id] = job
+    if durable:
+        save_durable_jobs()
+    print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
+    return job    
+
+def cancel_job(job_id: str) -> str:
+    """Cancel a cron job."""
+    with cron_lock:
+        job = scheduled_jobs.pop(job_id, None)
+    if not job:
+        return f"Job {job_id} not found"
+    if job.durable:
+        save_durable_jobs()
+    print(f"  \033[31m[cron cancel] {job_id}\033[0m")
+    return f"Cancelled {job_id}"
+
+def cron_scheduler_loop():
+    """Independent daemon thread: poll every 1s, fire matching jobs.
+    Individual job errors are caught to prevent one bad job from
+    killing the entire scheduler thread."""
+    while True:
+        time.sleep(1)
+        now = datetime.now()
+        # Date-aware marker prevents daily jobs from skipping on day 2+
+        minute_marker = now.strftime("%Y-%m-%d %H:%M")
+        need_save = False
+        with cron_lock:
+            for job in list(scheduled_jobs.values()): # list() to avoid "dictionary changed size during iteration" error
+                try:
+                    if cron_matches(job.cron, now):
+                        if _last_fired.get(job.id) != minute_marker:
+                            cron_queue.append(job)
+                            _last_fired[job.id] = minute_marker
+                            print(f"  \033[35m[cron fire] {job.id} → "
+                                  f"{job.prompt[:40]}\033[0m")
+                        if not job.recurring:
+                            scheduled_jobs.pop(job.id, None)
+                            if job.durable:
+                                need_save = True
+                except Exception as e:
+                    print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
+        if need_save:
+            save_durable_jobs()
+
+def consume_cron_queue() -> list[CronJob]:
+    """Consume fired jobs from cron_queue (called by agent_loop)."""
+    with cron_lock:
+        fired = list(cron_queue)
+        cron_queue.clear()
+    return fired
+
+def has_cron_queue() -> bool:
+    """Return whether fired cron jobs are waiting to be delivered."""
+    with cron_lock:
+        return bool(cron_queue)
+    
+def start_runtime():
+    load_durable_jobs()
+
+    scheduler = threading.Thread(
+        target=cron_scheduler_loop,
+        daemon=True,
+        name="cron-scheduler",
+    )
+    processor = threading.Thread(
+        target=queue_processor_loop,
+        daemon=True,
+        name="cron-queue-processor",
+    )
+
+    scheduler.start()
+    processor.start()
+
+
 MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 
 def agent_loop(context: dict, message: list):
@@ -1320,6 +1601,15 @@ def agent_loop(context: dict, message: list):
             system = get_system_prompt(context)
             continue    
 
+        fired = consume_cron_queue()
+        for job in fired:
+            message.append({"role": "user",
+                             "content": f"[Scheduled] {job.prompt}"})
+            print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
+        
+        context = update_context(context, message)
+        system = get_system_prompt(context)
+
         try:
             # s10改动：不再构造 request_messages，也不再把 memory 拼进最新 user.content。
             # messages 保持真实对话历史；runtime 状态全部走 system prompt。
@@ -1345,13 +1635,13 @@ def agent_loop(context: dict, message: list):
                 message.append({"role": "assistant", "content": [
                     {"type": "text",
                      "text": "[Error] Context too large, cannot continue."}]})
-                return
+                return context
             # Unrecoverable
             name = type(e).__name__
             print(f"  \033[31m[unrecoverable] {name}: {str(e)[:100]}\033[0m")
             message.append({"role": "assistant", "content": [
                 {"type": "text", "text": f"[Error] {name}: {str(e)[:200]}"}]})
-            return
+            return context
 
 
         # ── Path 1: max_tokens -> escalate or continue ──
@@ -1372,7 +1662,7 @@ def agent_loop(context: dict, message: list):
                       f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m")
                 continue
             print("  \033[31m[max_tokens] recovery limit reached\033[0m")
-            return
+            return context
         # Normal completion: append assistant response
         message.append({"role": "assistant", "content": response.content})
 
@@ -1390,7 +1680,7 @@ def agent_loop(context: dict, message: list):
             extraction_source = pre_compress + [{"role": "assistant", "content": response.content}]
             extract_memories(extraction_source)
             consolidate_memories()
-            return
+            return context
 
         rounds_since_todo += 1
         compact_after_tool_round = False  # s10改动：compact 只做标记，先保证 tool_use/tool_result 配对完整。
@@ -1461,35 +1751,76 @@ def agent_loop(context: dict, message: list):
         continue
 
 
+session_history: list = []
+session_context = update_context({}, [])
+
+
+def print_latest_assistant_text(messages: list):
+    """Print text blocks from the latest assistant message."""
+    if not messages:
+        return
+    msg = messages[-1]
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        print(content)
+        return
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            print(block.text)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            print(block.get("text", ""))
+
+
+def run_agent_turn_locked(user_query: str | None = None):
+    """Run one agent turn. Caller must hold agent_lock."""
+    global session_context
+    if user_query is not None:
+        session_history.append({"role": "user", "content": user_query})
+    session_context = agent_loop(session_context, session_history)
+    session_context = update_context(session_context, session_history)
+    print_latest_assistant_text(session_history)
+    print()
+
+
+def queue_processor_loop():
+    """Auto-deliver fired cron jobs when the agent is idle."""
+    global session_context
+    while True:
+        time.sleep(0.2)
+        if not has_cron_queue():
+            continue
+        if not agent_lock.acquire(blocking=False):
+            continue
+        try:
+            if not has_cron_queue():  # double-check 再次判断考虑到时间差
+                continue
+            print("\n  \033[35m[queue processor] delivering scheduled work\033[0m")
+            run_agent_turn_locked()
+        finally:
+            agent_lock.release()
+
+
 if __name__ == "__main__":
-    print("s10_optimized_agent_loop")
+    print("s14_agent_loop")
     print("Enter a question and press Enter to send. Type exit to quit.\n")
 
-    history = []
-    context = update_context({}, [])
+    start_runtime()
+
     while True:
         try:
             query = input(">>> ")
         except (EOFError, KeyboardInterrupt):
             break
+
         if query.strip().lower() in {"exit", "q"}:
             break
 
+        if not query.strip():
+            continue
+
         trigger_hooks("UserPromptSubmit", query)
-        history.append({"role": "user", "content": query})
 
-        # s10改动：先把最新用户输入纳入 context，再进入 agent_loop。
-        context = update_context(context, history)
-        agent_loop(context, history)
-
-        # s10改动：agent_loop 结束后可能写入了新 memory，因此再刷新一次，供下一轮使用。
-        context = update_context(context, history)
-
-        response = history[-1].get("content", "")
-        if isinstance(response, list):
-            for block in response:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
-        elif isinstance(response, str):
-            print(response)
-        print()
+        with agent_lock:
+            run_agent_turn_locked(query)

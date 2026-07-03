@@ -432,7 +432,7 @@ def agent_loop(messages: list, context: dict):
 
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block)
-                results.append({"type": "tool_result",
+                results.append({"type": "tool_result",  #  这一步很关键：原始的 tool_use 必须马上对应一个 tool_result，否则消息结构不完整
                                 "tool_use_id": block.id,
                                 "content": f"[Background task {bg_id} started] "
                                            f"Command: {block.input.get('command', '')}. "

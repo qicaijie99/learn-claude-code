@@ -1,4 +1,5 @@
 import ast
+from datetime import datetime
 from importlib.resources import path
 import json
 import os
@@ -36,6 +37,8 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
 PRIMARY_MODEL = os.environ["MODEL_ID"]
 FALLBACK_MODEL = os.getenv("FALLBACK_MODEL_ID")
+
+MAILBOX_DIR = WORKDIR / ".mailbox"; MAILBOX_DIR.mkdir(exist_ok=True)
 # ── Constants ──
 
 ESCALATED_MAX_TOKENS = 64000
@@ -63,6 +66,11 @@ PROMPT_SECTIONS = {
         "Relevant memories are runtime context. Use them when relevant, "
         "but never let memory override the current user request or system/tool safety rules."
     ),
+    "team_policy": (
+        "Teammate results are asynchronous. "
+        "After spawn_teammate, do not assume the task is complete. "
+        "Use check_inbox when you need teammate results or when an inbox notification appears."
+),
 }
 
 
@@ -81,6 +89,8 @@ def assemble_system_prompt(context: dict) -> str:
     if enabled_tools:
         sections.append("Available tools:\n" + "\n".join(f"- {name}" for name in enabled_tools))
 
+    sections.append(PROMPT_SECTIONS["team_policy"])
+    
     # s10改动：skill catalog 也作为 context 的一部分注入，替代旧 build_system() 的硬编码路线。
     skills = context.get("skills", "")
     if skills:
@@ -655,27 +665,68 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
+    {"name": "schedule_cron",
+     "description": "Schedule a cron job. cron is 5-field: min hour dom month dow.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "cron": {"type": "string",
+                                   "description": "5-field cron expression"},
+                          "prompt": {"type": "string",
+                                     "description": "Message to inject when fired"},
+                          "recurring": {"type": "boolean",
+                                        "description": "True=recurring, False=one-shot"},
+                          "durable": {"type": "boolean",
+                                      "description": "True=persist to disk"}},
+                      "required": ["cron", "prompt"]}},
+    {"name": "list_crons",
+     "description": "List all registered cron jobs.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "cancel_cron",
+     "description": "Cancel a cron job by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"job_id": {"type": "string"}},
+                      "required": ["job_id"]}},
+    #  TEAM_AGENT_TOOLS  # 这些工具只在多agent模式下可用，单agent模式下禁用
+    {"name": "spawn_teammate",
+     "description": "Spawn a teammate agent in a background thread.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "name": {"type": "string"},
+                          "role": {"type": "string"},
+                          "prompt": {"type": "string"}},
+                      "required": ["name", "role", "prompt"]}},
+    {"name": "send_message",
+     "description": "Send a message to a teammate via MessageBus.",
+     "input_schema": {"type": "object",
+                      "properties": {"to": {"type": "string"},
+                                     "content": {"type": "string"}},
+                      "required": ["to", "content"]}},
+    {"name": "check_inbox",
+     "description": "Check Lead's inbox for teammate messages.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},                  
 ]
 
-SUB_TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}},
-    {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["file_path", "old_text", "new_text"]}},
-    {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-]
+# SUB_TOOLS = [
+#     {"name": "bash", "description": "Run a shell command.",
+#      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+#     {"name": "read_file", "description": "Read file contents.",
+#      "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}, "required": ["file_path"]}},
+#     {"name": "write_file", "description": "Write content to a file.",
+#      "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "content": {"type": "string"}}, "required": ["file_path", "content"]}},
+#     {"name": "edit_file", "description": "Replace exact text in a file once.",
+#      "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["file_path", "old_text", "new_text"]}},
+#     {"name": "glob", "description": "Find files matching a glob pattern.",
+#      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+# ]
 # 暂时硬编码禁用子agent的task工具及todo_list，防止子agent递归调用
 
-TOOLS.append({
-    "name": "task",
-    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
-})              
+# TOOLS.append({
+#     "name": "task",
+#     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+#     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+# })              
 
 def run_bash(command) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -790,6 +841,31 @@ def run_claim_task(task_id: str) -> str:
 
 def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
+
+def run_schedule_cron(cron: str, prompt: str,
+                      recurring: bool = True, durable: bool = True) -> str:
+    result = schedule_job(cron, prompt, recurring, durable)
+    if isinstance(result, str):
+        return f"Error: {result}"
+    return f"Scheduled {result.id}: '{cron}' → {prompt}"
+
+
+def run_list_crons() -> str:
+    with cron_lock:
+        jobs = list(scheduled_jobs.values())
+    if not jobs:
+        return "No cron jobs. Use schedule_cron to add one."
+    lines = []
+    for j in jobs:
+        tag = "recurring" if j.recurring else "one-shot"
+        dur = "durable" if j.durable else "session"
+        lines.append(f"  {j.id}: '{j.cron}' → {j.prompt[:40]} "
+                     f"[{tag}, {dur}]")
+    return "\n".join(lines)
+
+
+def run_cancel_cron(job_id: str) -> str:
+    return cancel_job(job_id)
 
 CURRENT_TODOS: list[dict] = []
 def _normalize_todos(todos):
@@ -988,50 +1064,50 @@ def extract_text(content) -> str:
     # return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text") # "type"不是"text"时b = None，返回默认值""一个空字符串
     return "\n".join(get_block_text(b) for b in content if get_block_type(b) == "text")
 # 实现子agent
-def spawn_subagent(description: str) -> str:
-    """Spawn a subagent with fresh messages[], return summary only."""
-    print(f"\n\033[35m[Subagent spawned]\033[0m")
-    messages = [{"role": "user", "content": description}]  # fresh context
-    results = []  # s10改动：提前初始化，避免子 agent 第一次就自然语言结束时 results 未定义。
+# def spawn_subagent(description: str) -> str:
+#     """Spawn a subagent with fresh messages[], return summary only."""
+#     print(f"\n\033[35m[Subagent spawned]\033[0m")
+#     messages = [{"role": "user", "content": description}]  # fresh context
+#     results = []  # s10改动：提前初始化，避免子 agent 第一次就自然语言结束时 results 未定义。
 
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
+#     for _ in range(30):  # safety limit
+#         response = client.messages.create(
+#             model=MODEL, system=SUB_SYSTEM,
+#             messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+#         )
+#         messages.append({"role": "assistant", "content": response.content})
+#         if response.stop_reason != "tool_use":
+#             break
 
-        results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            blocked = trigger_hooks("PreToolUse", block)
-            if blocked:
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": str(blocked)})
-                continue
-            handler = SUB_TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"Unknown: {block.name}"
-            trigger_hooks("PostToolUse", block, output)
-            print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
-            results.append({"type": "tool_result", "tool_use_id": block.id,
-                            "content": str(output)})
-        messages.append({"role": "user", "content": results})
+#         results = []
+#         for block in response.content:
+#             if block.type != "tool_use":
+#                 continue
+#             blocked = trigger_hooks("PreToolUse", block)
+#             if blocked:
+#                 results.append({"type": "tool_result", "tool_use_id": block.id,
+#                                 "content": str(blocked)})
+#                 continue
+#             handler = SUB_TOOL_HANDLERS.get(block.name)
+#             output = handler(**block.input) if handler else f"Unknown: {block.name}"
+#             trigger_hooks("PostToolUse", block, output)
+#             print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+#             results.append({"type": "tool_result", "tool_use_id": block.id,
+#                             "content": str(output)})
+#         messages.append({"role": "user", "content": results})
 
-    result = extract_text(messages[-1]["content"])
-    if not result:
-        # s10改动：优先回退查找最后一条 assistant 自然语言，避免把最后的 tool_result 当最终答案。
-        for msg in reversed(messages):
-            if msg.get("role") == "assistant":
-                result = extract_text(msg.get("content", ""))
-                if result:
-                    break
-        if not result:
-            result = "Subagent stopped after 30 turns without final answer."
-    print(f"\033[35m[Subagent done]\033[0m")
-    return result
+#     result = extract_text(messages[-1]["content"])
+#     if not result:
+#         # s10改动：优先回退查找最后一条 assistant 自然语言，避免把最后的 tool_result 当最终答案。
+#         for msg in reversed(messages):
+#             if msg.get("role") == "assistant":
+#                 result = extract_text(msg.get("content", ""))
+#                 if result:
+#                     break
+#         if not result:
+#             result = "Subagent stopped after 30 turns without final answer."
+#     print(f"\033[35m[Subagent done]\033[0m")
+#     return result
 
 CONTEXT_LIMIT = 50000; KEEP_RECENT = 3; PERSIST_THRESHOLD = 30000
 def estimate_size(msgs): return len(str(msgs))
@@ -1171,23 +1247,6 @@ def reactive_compact(messages, state=None):
 # 主动压缩：compact_history，全量替换成 summary
 # 紧急压缩：reactive_compact，总结旧历史 + 保留最近尾部
 
-TOOL_HANDLERS = {
-    "task": spawn_subagent,
-    "bash": run_bash,
-    "read_file": run_read,
-    "write_file": run_write,
-    "edit_file": run_edit,
-    "glob": run_glob,
-    "todo_list": sync_todo_list,
-    "load_skill": load_skill,
-    "create_task": run_create_task, "list_tasks": run_list_tasks,
-    "get_task": run_get_task, "claim_task": run_claim_task,
-    "complete_task": run_complete_task,
-}
-SUB_TOOL_HANDLERS = {
-    "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,
-}
 
 # ── Background Tasks (s13 new) ──
 _bg_counter = 0
@@ -1264,6 +1323,404 @@ def collect_background_results() -> list[str]:
               f"{task['command'][:40]} ({len(output)} chars)\033[0m")
     return notifications
 
+# ── Cron Scheduler (s14 new) ──
+
+DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
+
+@dataclass
+class CronJob:
+    id: str
+    cron: str        # "0 9 * * *"
+    prompt: str      # message to inject when fired
+    recurring: bool  # True = recurring, False = one-shot
+    durable: bool    # True = persist to disk
+
+scheduled_jobs: dict[str, CronJob] = {}
+cron_queue: list[CronJob] = []
+cron_lock = threading.Lock()
+agent_lock = threading.Lock()
+_last_fired: dict[str, str] = {}  # job_id → "YYYY-MM-DD HH:MM"
+
+def _cron_field_matches(field: str, value: int) -> bool:  # 例如_cron_field_matches("*/5", 5)   # 判断分钟字段是否匹配
+    """Check if a single cron field matches a value."""
+    if "," in field:
+        return any(_cron_field_matches(f.strip(), value)
+                   for f in field.split(","))
+    # 每隔 n 个单位匹配一次
+    if field.startswith("*/"):
+        try:
+            n = int(field[2:])
+            return n > 0 and value % n == 0
+        except ValueError: return False
+    if field == "*": return True
+    if "-" in field: 
+        try:
+            start, end = map(int, field.split("-")) #  map(int, ...)：将该int()函数应用于列表中的每个项目，将它们从字符串数据类型更改为整数数据类型。
+            return start <= value <= end
+        except ValueError: return False
+    return str(value) == field
+
+def cron_matches(cron_expr: str, dt: datetime) -> bool:
+    """Check if a 5-field cron expression matches the given datetime.
+    Standard cron semantics: DOM and DOW use OR when both are constrained."""
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return False
+    minute, hour, dom, month, dow = fields
+    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
+
+    m = _cron_field_matches(minute, dt.minute)
+    h = _cron_field_matches(hour, dt.hour)
+    dom_ok = _cron_field_matches(dom, dt.day)
+    month_ok = _cron_field_matches(month, dt.month)
+    dow_ok = _cron_field_matches(dow, dow_val)
+
+    # Minute, hour, month must all match
+    if not (m and h and month_ok):
+        return False
+    # DOM and DOW: if both constrained, either matching is enough (OR)
+    dom_unconstrained = dom == "*"
+    dow_unconstrained = dow == "*"
+    if dom_unconstrained and dow_unconstrained:
+        return True
+    if dom_unconstrained:
+        return dow_ok
+    if dow_unconstrained:
+        return dom_ok
+    return dom_ok or dow_ok
+
+def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
+    if "," in field:
+        for part in field.split(","):
+            error = _validate_cron_field(part.strip(), lo, hi)
+            if error:
+                return error
+        return None
+    if field == "*":
+        return None
+    if field.startswith("*/"):
+        step = field[2:]
+        if not step.isdigit():
+            return f"invalid step '{field}'"
+        if int(step) <= 0:
+            return f"step must be greater than zero: '{field}'"
+        return None
+    if "-" in field:
+        parts = field.split("-", 1)
+        if len(parts) != 2 or not all(part.isdigit() for part in parts):
+            return f"invalid range '{field}'"
+        start, end = map(int, parts)
+        if not (lo <= start <= end <= hi):
+            return f"range '{field}' outside [{lo}, {hi}]"
+        return None
+    if not field.isdigit():
+        return f"invalid value '{field}'"
+    value = int(field)
+    if not lo <= value <= hi:
+        return f"value {value} outside [{lo}, {hi}]"
+    return None
+
+def validate_cron(cron_expr: str) -> str | None:
+    """Validate a cron expression. Returns error message or None."""
+    fields = cron_expr.strip().split()
+    if len(fields) != 5:
+        return f"Expected 5 fields, got {len(fields)}"
+    bounds = [(0, 59), (0, 23), (1, 31), (1, 12), (0, 6)]
+    names = ["minute", "hour", "day-of-month", "month", "day-of-week"]
+    for i, (field, (start, end), name) in enumerate(zip(fields, bounds, names)):
+        err = _validate_cron_field(field, start, end)
+        if err:
+            return f"{name}: {err}"
+    return None
+
+
+def save_durable_jobs():
+    """Persist durable jobs to .scheduled_tasks.json."""
+    with cron_lock:
+        payload = [
+            asdict(job) for job in scheduled_jobs.values()
+            if job.durable
+        ]
+    temp_path = DURABLE_PATH.with_suffix(".tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, DURABLE_PATH)
+
+def load_durable_jobs():
+    """Load durable jobs from disk on startup."""
+    if not DURABLE_PATH.exists():
+        return
+    try:
+        jobs = json.loads(DURABLE_PATH.read_text())
+        for j in jobs:
+            job = CronJob(**j)
+            err = validate_cron(job.cron)
+            if err:
+                print(f"  \033[31m[cron] skipping invalid job {job.id}: {err}\033[0m")
+                continue
+            scheduled_jobs[job.id] = job
+        valid = [j for j in jobs if j["id"] in scheduled_jobs]
+        if valid:
+            print(f"  \033[35m[cron] loaded {len(valid)} durable job(s)\033[0m")
+    except Exception:
+        pass
+
+def schedule_job(cron: str, prompt: str, recurring: bool = True,
+                 durable: bool = True) -> CronJob | str:
+    """Register a new cron job. Returns CronJob or error string."""
+    err = validate_cron(cron)
+    if err:
+        return err
+    job = CronJob(  # 创建一个新job对象
+        id=f"cron_{random.randint(0, 999999):06d}",
+        cron=cron, prompt=prompt,
+        recurring=recurring, durable=durable,
+    )
+    with cron_lock:
+        scheduled_jobs[job.id] = job
+    if durable:
+        save_durable_jobs()
+    print(f"  \033[35m[cron register] {job.id} '{cron}' → {prompt[:40]}\033[0m")
+    return job    
+
+def cancel_job(job_id: str) -> str:
+    """Cancel a cron job."""
+    with cron_lock:
+        job = scheduled_jobs.pop(job_id, None)
+    if not job:
+        return f"Job {job_id} not found"
+    if job.durable:
+        save_durable_jobs()
+    print(f"  \033[31m[cron cancel] {job_id}\033[0m")
+    return f"Cancelled {job_id}"
+
+def cron_scheduler_loop():
+    """Independent daemon thread: poll every 1s, fire matching jobs.
+    Individual job errors are caught to prevent one bad job from
+    killing the entire scheduler thread."""
+    while True:
+        time.sleep(1)
+        now = datetime.now()
+        # Date-aware marker prevents daily jobs from skipping on day 2+
+        minute_marker = now.strftime("%Y-%m-%d %H:%M")
+        need_save = False
+        with cron_lock:
+            for job in list(scheduled_jobs.values()): # list() to avoid "dictionary changed size during iteration" error
+                try:
+                    if cron_matches(job.cron, now):
+                        if _last_fired.get(job.id) != minute_marker:
+                            cron_queue.append(job)
+                            _last_fired[job.id] = minute_marker
+                            print(f"  \033[35m[cron fire] {job.id} → "
+                                  f"{job.prompt[:40]}\033[0m")
+                        if not job.recurring:
+                            scheduled_jobs.pop(job.id, None)
+                            if job.durable:
+                                need_save = True
+                except Exception as e:
+                    print(f"  \033[31m[cron error] {job.id}: {e}\033[0m")
+        if need_save:
+            save_durable_jobs()
+
+def consume_cron_queue() -> list[CronJob]:
+    """Consume fired jobs from cron_queue (called by agent_loop)."""
+    with cron_lock:
+        fired = list(cron_queue)
+        cron_queue.clear()
+    return fired
+
+def has_cron_queue() -> bool:
+    """Return whether fired cron jobs are waiting to be delivered."""
+    with cron_lock:
+        return bool(cron_queue)
+    
+def start_runtime():
+    load_durable_jobs()
+
+    scheduler = threading.Thread(
+        target=cron_scheduler_loop,
+        daemon=True,
+        name="cron-scheduler",
+    )
+    processor = threading.Thread(
+        target=queue_processor_loop,
+        daemon=True,
+        name="cron-queue-processor",
+    )
+
+    inbox_processor = threading.Thread(
+        target=inbox_processor_loop,
+        daemon=True,
+        name="lead-inbox-processor",
+    )    
+
+    scheduler.start()
+    processor.start()
+    inbox_processor.start()
+
+class MessageBus:
+    """File-based message bus. Each agent has a .jsonl inbox.
+    Read is destructive: read_text + unlink (consumes messages).
+    Teaching version: no file locking; real CC uses proper-lockfile."""
+
+    def send(self, from_agent: str, to_agent: str, content: str,
+             msg_type: str = "message"):
+        msg = {"from": from_agent, "to": to_agent,
+               "content": content, "type": msg_type,
+               "ts": time.time()}
+        inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
+        with open(inbox, "a") as f:
+            f.write(json.dumps(msg) + "\n")
+        print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
+              f"{content[:50]}\033[0m")
+
+    def read_inbox(self, agent: str) -> list[dict]:
+        inbox = MAILBOX_DIR / f"{agent}.jsonl"
+        if not inbox.exists():
+            return []
+        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+                if line.strip()]
+        inbox.unlink()  # consume: read + delete
+        return msgs
+
+BUS = MessageBus()
+
+# Track spawned teammates
+active_teammates: dict[str, bool] = {}
+
+def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    """Spawn a teammate agent in a background thread.
+    Teaching version: max 10 rounds per teammate.
+    Real CC: teammates use idle loop (wait for inbox, work, repeat)
+    until shutdown_request."""
+    if name in active_teammates:
+        return f"Teammate '{name}' already exists"
+
+    system = (f"You are '{name}', a {role}. "
+              f"Use tools to complete tasks. "
+              f"Send results via send_message to 'lead'.")
+
+    def run():
+        messages = [{"role": "user", "content": prompt}]
+        sub_tools = [
+            {"name": "bash", "description": "Run a shell command.",
+             "input_schema": {"type": "object",
+                              "properties": {"command": {"type": "string"}},
+                              "required": ["command"]}},
+            {"name": "read_file", "description": "Read file contents.",
+             "input_schema": {"type": "object",
+                              "properties": {"file_path": {"type": "string"}},
+                              "required": ["file_path"]}},
+            {"name": "write_file", "description": "Write content to a file.",
+             "input_schema": {"type": "object",
+                              "properties": {"file_path": {"type": "string"},
+                                             "content": {"type": "string"}},
+                              "required": ["file_path", "content"]}},
+            {"name": "send_message",
+             "description": "Send a message to another agent.",
+             "input_schema": {"type": "object",
+                              "properties": {"to": {"type": "string"},
+                                             "content": {"type": "string"}},
+                              "required": ["to", "content"]}},
+        ]
+        sub_handlers = {
+            "bash": run_bash, "read_file": run_read, "write_file": run_write,
+            "send_message": lambda to, content: (BUS.send(name, to, content),
+                                                  "Sent")[1],
+        }
+
+        for _ in range(10):
+            inbox = BUS.read_inbox(name)
+            if inbox:
+                messages.append({"role": "user",
+                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
+            try:
+                response = client.messages.create(
+                    model=MODEL, system=system, messages=messages[-20:],
+                    tools=sub_tools, max_tokens=8000)
+            except Exception:
+                break
+            messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason != "tool_use":
+                break
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    handler = sub_handlers.get(block.name)
+                    output = handler(**block.input) if handler else "Unknown"
+                    results.append({"type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": str(output)})
+            messages.append({"role": "user", "content": results})
+
+        # Send final summary to Lead
+        summary = "Done."
+        for msg in reversed(messages):
+            if msg["role"] == "assistant" and isinstance(msg["content"], list):
+                for b in msg["content"]:
+                    if getattr(b, "type", None) == "text":
+                        summary = b.text
+                        break
+                else:
+                    continue
+                break
+        BUS.send(name, "lead", summary, "result")
+        active_teammates.pop(name, None)
+        print(f"  \033[32m[teammate] {name} finished\033[0m")
+
+    active_teammates[name] = True
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return f"Teammate '{name}' spawned as {role}."   
+# ── Team Tool Handlers ──
+
+def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
+    return spawn_teammate_thread(name, role, prompt)
+
+
+def run_send_message(to: str, content: str) -> str:
+    BUS.send("lead", to, content)
+    return f"Sent to {to}"
+
+def run_check_inbox() -> str:
+    msgs = BUS.read_inbox("lead")
+    if not msgs:
+        return "(inbox empty)"
+
+    text = json.dumps(msgs, ensure_ascii=False, indent=2)
+
+    if len(text) > 12000:
+        text = text[:12000] + "\n... [truncated]"
+
+    return f"<lead_inbox>\n{text}\n</lead_inbox>"
+
+
+TOOL_HANDLERS = {
+    # "task": spawn_subagent,
+    "bash": run_bash,
+    "read_file": run_read,
+    "write_file": run_write,
+    "edit_file": run_edit,
+    "glob": run_glob,
+    "todo_list": sync_todo_list,
+    "load_skill": load_skill,
+    "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "get_task": run_get_task, "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
+    "schedule_cron": run_schedule_cron, "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
+    "spawn_teammate": run_spawn_teammate,
+    "send_message": run_send_message,
+    "check_inbox": run_check_inbox
+}
+SUB_TOOL_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
+}
+
+
 MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
 
 def agent_loop(context: dict, message: list):
@@ -1320,6 +1777,15 @@ def agent_loop(context: dict, message: list):
             system = get_system_prompt(context)
             continue    
 
+        fired = consume_cron_queue()
+        for job in fired:
+            message.append({"role": "user",
+                             "content": f"[Scheduled] {job.prompt}"})
+            print(f"  \033[35m[inject cron] {job.prompt[:50]}\033[0m")
+        
+        context = update_context(context, message)
+        system = get_system_prompt(context)
+
         try:
             # s10改动：不再构造 request_messages，也不再把 memory 拼进最新 user.content。
             # messages 保持真实对话历史；runtime 状态全部走 system prompt。
@@ -1345,13 +1811,13 @@ def agent_loop(context: dict, message: list):
                 message.append({"role": "assistant", "content": [
                     {"type": "text",
                      "text": "[Error] Context too large, cannot continue."}]})
-                return
+                return context
             # Unrecoverable
             name = type(e).__name__
             print(f"  \033[31m[unrecoverable] {name}: {str(e)[:100]}\033[0m")
             message.append({"role": "assistant", "content": [
                 {"type": "text", "text": f"[Error] {name}: {str(e)[:200]}"}]})
-            return
+            return context
 
 
         # ── Path 1: max_tokens -> escalate or continue ──
@@ -1372,7 +1838,7 @@ def agent_loop(context: dict, message: list):
                       f" {state.recovery_count}/{MAX_RECOVERY_RETRIES}\033[0m")
                 continue
             print("  \033[31m[max_tokens] recovery limit reached\033[0m")
-            return
+            return context
         # Normal completion: append assistant response
         message.append({"role": "assistant", "content": response.content})
 
@@ -1390,7 +1856,7 @@ def agent_loop(context: dict, message: list):
             extraction_source = pre_compress + [{"role": "assistant", "content": response.content}]
             extract_memories(extraction_source)
             consolidate_memories()
-            return
+            return context
 
         rounds_since_todo += 1
         compact_after_tool_round = False  # s10改动：compact 只做标记，先保证 tool_use/tool_result 配对完整。
@@ -1461,35 +1927,130 @@ def agent_loop(context: dict, message: list):
         continue
 
 
+session_history: list = []
+session_context = update_context({}, [])
+
+
+def print_latest_assistant_text(messages: list):
+    """Print text blocks from the latest assistant message."""
+    if not messages:
+        return
+    msg = messages[-1]
+    if not isinstance(msg, dict) or msg.get("role") != "assistant":
+        return
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        print(content)
+        return
+    for block in content:
+        if getattr(block, "type", None) == "text":
+            print(block.text)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            print(block.get("text", ""))
+
+
+def run_agent_turn_locked(user_query: str | None = None):
+    """Run one agent turn. Caller must hold agent_lock."""
+    global session_context
+    global session_history
+    if user_query is not None:
+        session_history.append({"role": "user", "content": user_query})
+    session_context = agent_loop(session_context, session_history)
+    session_context = update_context(session_context, session_history)
+    print_latest_assistant_text(session_history)
+    print()
+
+
+def queue_processor_loop():
+    """Auto-deliver fired cron jobs when the agent is idle."""
+    global session_context
+    while True:
+        time.sleep(0.2)
+        if not has_cron_queue():
+            continue
+        if not agent_lock.acquire(blocking=False):
+            continue
+        try:
+            if not has_cron_queue():  # double-check 再次判断考虑到时间差
+                continue
+            print("\n  \033[35m[queue processor] delivering scheduled work\033[0m")
+            run_agent_turn_locked()
+        finally:
+            agent_lock.release()
+
+def update_inbox_history(inbox_text:str):
+    global session_history
+    try:
+        session_history.append({"role": "user", "content": inbox_text})
+    except Exception as e:
+        print(f"Error updating inbox history: {e}")
+
+def has_inbox(agent: str) -> bool:
+    inbox = MAILBOX_DIR / f"{agent}.jsonl"
+    return inbox.exists() and inbox.stat().st_size > 0
+
+def inbox_processor_loop():
+    """Auto-notify Lead when teammate messages are waiting.
+    Important:
+    This loop does NOT read the inbox.
+    It only injects a reminder so the Lead can decide whether to call check_inbox.
+    """
+    last_seen_mtime = 0.0
+    while True:
+        time.sleep(0.5)
+        inbox = MAILBOX_DIR / "lead.jsonl"
+        if not inbox.exists():
+            continue
+        try:
+            mtime = inbox.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        # 没有新变化就不重复提醒
+        if mtime == last_seen_mtime:
+            continue
+        # agent 正忙时不要抢锁
+        if not agent_lock.acquire(blocking=False):
+            continue
+        try:
+            if not has_inbox("lead"):
+                continue
+            last_seen_mtime = mtime
+            print("\n  \033[33m[inbox processor] lead inbox has message(s)\033[0m")
+            run_agent_turn_locked(
+                "<inbox_notification>"
+                "Teammate messages may be available. "
+                "Decide whether to call check_inbox before answering."
+                "</inbox_notification>"
+            )
+        finally:
+            agent_lock.release()
+
 if __name__ == "__main__":
-    print("s10_optimized_agent_loop")
+    print("s14_agent_loop")
     print("Enter a question and press Enter to send. Type exit to quit.\n")
 
-    history = []
-    context = update_context({}, [])
+    start_runtime()
+
     while True:
         try:
             query = input(">>> ")
         except (EOFError, KeyboardInterrupt):
             break
+
         if query.strip().lower() in {"exit", "q"}:
             break
 
+        if not query.strip():
+            continue
+
         trigger_hooks("UserPromptSubmit", query)
-        history.append({"role": "user", "content": query})
 
-        # s10改动：先把最新用户输入纳入 context，再进入 agent_loop。
-        context = update_context(context, history)
-        agent_loop(context, history)
-
-        # s10改动：agent_loop 结束后可能写入了新 memory，因此再刷新一次，供下一轮使用。
-        context = update_context(context, history)
-
-        response = history[-1].get("content", "")
-        if isinstance(response, list):
-            for block in response:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
-        elif isinstance(response, str):
-            print(response)
-        print()
+        with agent_lock:
+            run_agent_turn_locked(query)
+            # inbox = BUS.read_inbox("lead")
+            # if inbox:
+            #     inbox_text = "\n".join(
+            #         f"From {m['from']}: {m['content'][:200]}" for m in inbox)
+            #     update_inbox_history(inbox_text)
+            #     print(f"\n  \033[33m[inbox] {len(inbox)} new message(s)\033[0m")
+            print()    

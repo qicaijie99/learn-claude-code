@@ -1,0 +1,21 @@
+教学版实现的是最小 queue processor：用 agent_lock 判断 Agent 是否空闲，空闲时自动交付定时任务。真实 CC 的 useQueueProcessor.ts 还会处理 UI 阻塞、队列优先级和不同消息模式。
+
+重要前提：cron 调度器必须在 Agent 进程内跑。进程关闭，调度也停。Durable 只意味着任务定义跨重启保留，下次 Agent 启动时调度器才会发现"该触发了"并触发。如果需要"即使应用关闭也能定时跑"，请用系统 crontab 或 systemd timer。
+
+职责应调整为：
+Scheduler 只把任务标记为 queued。
+Queue processor 将任务原子地变为 inflight。
+Agent turn 成功结束后 ack。
+API 或工具失败时 nack，重新放回队列。
+one-shot 任务只能在 ack 后删除。
+
+对于 one-shot 任务更严重：它在触发时已经从 scheduled_jobs 和磁盘删除。如果进程在排队后、执行前崩溃，该任务永久丢失。
+
+P1：Durable 写入不是原子的
+位置：[self_code.py (line 1421)](G:/agentLn_ws/learn-claude-code/s14_cron_scheduler/self_code.py:1421)
+DURABLE_PATH.write_text(json.dumps(durable_list, indent=2))
+风险包括：
+进程中途退出，JSON 只写了一半。
+schedule、cancel、scheduler 三个路径可能并发写入。
+多个 Agent 进程会重复触发同一 durable 任务。
+读取异常被完全吞掉。
