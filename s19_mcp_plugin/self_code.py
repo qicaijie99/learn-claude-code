@@ -106,6 +106,10 @@ def assemble_system_prompt(context: dict) -> str:
     if memories:
         sections.append(PROMPT_SECTIONS["memory_policy"] + "\n\nRelevant memories:\n" + memories)
 
+    mcp_names = context.get("mcp_servers", [])
+    if mcp_names:
+        sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")    
+
     return "\n\n".join(sections)
 
 _last_context_key = None
@@ -126,7 +130,7 @@ def get_system_prompt(context: dict) -> str:
     if context.get("memory_index"):
         loaded.append("memory_index")
     if context.get("memories"):
-        loaded.append("relevant_memories")
+        loaded.append("relevant_memories")    
     print(f"  \033[32m[assembled] sections: {', '.join(loaded)}\033[0m")
     return _last_prompt 
 
@@ -142,9 +146,10 @@ def update_context(context: dict, messages: list) -> dict:
     """
     memory_index = read_memory_index()
     relevant_memories = load_memories(messages) if messages else ""
+    tools, _ = assemble_tool_pool()
 
     return {
-        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "enabled_tools": list(tool["name"] for tool in tools),
         "workspace": str(WORKDIR),
         "skills": list_skills(),
         "memory_index": memory_index,
@@ -155,6 +160,21 @@ def update_context(context: dict, messages: list) -> dict:
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
+TASK_LOCK = threading.RLock()
+LIFECYCLE_LOG_DIR = WORKDIR / ".agent_logs"
+LIFECYCLE_LOG_DIR.mkdir(exist_ok=True)
+LIFECYCLE_LOG_LOCK = threading.Lock()
+
+
+def log_lifecycle(agent: str, event: str, **details):
+    """Write one structured lifecycle event for debugging and recovery."""
+    record = {"ts": time.time(), "agent": agent, "event": event, **details}
+    path = LIFECYCLE_LOG_DIR / f"{agent}.jsonl"
+    with LIFECYCLE_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"  \033[90m[lifecycle] {agent}: {event} {detail_text}\033[0m")
 
 @dataclass
 class Task:
@@ -164,19 +184,32 @@ class Task:
     status: str          # pending | in_progress | completed
     owner: str | None    # Agent name (multi-agent scenarios)
     blockedBy: list[str] # Dependency task IDs
+    worktree: str | None = None  
 
 def _task_path(task_id: str) -> Path:
     return TASKS_DIR / f"{task_id}.json"
 
 def create_task(subject: str, description:str = "", blockedBy: list[str] | None = None) -> Task:
     """Create a new task and save it to disk."""
-    id = f"task_{int(time.time())}_{random.randint(1000,9999):04d}"
-    task = Task(id=id, subject=subject, description=description, status="pending", owner=None, blockedBy=blockedBy or [])
-    _save_task(task)
+    with TASK_LOCK:
+        while True:
+            id = f"task_{int(time.time())}_{random.randint(1000,9999):04d}"
+            if not _task_path(id).exists():
+                break
+        task = Task(id=id, subject=subject, description=description, status="pending", owner=None, blockedBy=blockedBy or [])
+        _save_task(task)
     return task
 
+
 def _save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), ensure_ascii=False, indent=2))  # asdict把 dataclass 对象转换成 dict 字典|中文不转义|JSON缩进两格
+    path = _task_path(task.id)
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(asdict(task), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
 def load_task(task_id: str) -> Task | None:
     return Task(**json.loads(_task_path(task_id).read_text())) 
 def list_tasks() -> list[Task]:
@@ -196,34 +229,76 @@ def can_start_task(task_id: str) -> bool:
 
 task_lock = threading.Lock()
 def claim_task(task_id: str, owner: str) -> str:
-    with task_lock:    
-        """Claim a task for a specific agent."""
+    """Atomically claim a pending, unowned, unblocked task."""
+    with TASK_LOCK:
         task = load_task(task_id)
         if task.status != "pending":
-            return f"Error: Task {task_id} can't claim."
+            return f"Error: Task {task_id} is {task.status}, can't claim."
+        if task.owner:
+            return f"Error: Task {task_id} already owned by {task.owner}."
         if not can_start_task(task_id):
-            deps = [d for d in task.blockedBy if not _task_path(d).exists() or load_task(d).status != "completed"] #  ps：先判断文件是否存在，再读文件，否则如果文件不存在会熔断
+            deps = [d for d in task.blockedBy if not _task_path(d).exists() or load_task(d).status != "completed"]
             return f"Blocked by: {deps}"
         task.owner = owner
         task.status = "in_progress"
         _save_task(task)
     print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
+    log_lifecycle(owner, "task_claimed", task_id=task.id, subject=task.subject)
     return f"Claimed {task.id} ({task.subject})"
 
-def complete_task(task_id: str) -> str:
-    """Mark a task as completed."""
-    task = load_task(task_id)
-    if task.status != "in_progress":
-        return f"Error: Task {task_id} can't complete."
-    task.status = "completed"
-    _save_task(task)
+
+def complete_task(task_id: str, owner: str | None = None) -> str:
+    """Complete a task, optionally enforcing its current owner."""
+    with TASK_LOCK:
+        task = load_task(task_id)
+        if task.status != "in_progress":
+            return f"Error: Task {task_id} is {task.status}, can't complete."
+        if owner is not None and task.owner != owner:
+            return f"Error: Task {task_id} owned by {task.owner}, not {owner}."
+        task.status = "completed"
+        _save_task(task)
     print(f"  \033[32m[complete] {task.subject} → completed\033[0m")
+    log_lifecycle(owner or task.owner or "agent", "task_completed", task_id=task.id, subject=task.subject)
     msg = f"Completed {task.id} ({task.subject})"
     unblocked = [t.subject for t in list_tasks() if t.status == "pending" and can_start_task(t.id) and t.blockedBy]
     if unblocked:
         msg += f"\nUnblocked tasks: {', '.join(unblocked)}"
         print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
     return msg
+
+def release_tasks_for_owner(owner: str, reason: str) -> list[str]:
+    """Return tasks owned by a stopped teammate to the pending queue."""
+    released = []
+    with TASK_LOCK:
+        for task in list_tasks():
+            if task.status != "in_progress" or task.owner != owner:
+                continue
+            task.status = "pending"
+            task.owner = None
+            _save_task(task)
+            released.append(task.id)
+    if released:
+        log_lifecycle(owner, "tasks_requeued", task_ids=released, reason=reason)
+    return released
+
+
+def recover_orphaned_tasks(active_owners: set[str] | None = None) -> list[str]:
+    """Recover in-progress tasks whose owners are not active after restart."""
+    active_owners = active_owners or set()
+    recovered = []
+    with TASK_LOCK:
+        for task in list_tasks():
+            if task.status != "in_progress" or not task.owner:
+                continue
+            if task.owner in active_owners:
+                continue
+            previous_owner = task.owner
+            task.status = "pending"
+            task.owner = None
+            _save_task(task)
+            recovered.append(task.id)
+            log_lifecycle(previous_owner, "orphan_recovered", task_id=task.id)
+    return recovered
 
 
 
@@ -563,172 +638,6 @@ SUB_SYSTEM = (
     "Do not delegate further." # s06todo
 )
 
-# 工具说明书
-TOOLS = [
-    {
-        "name": "bash",
-        "description": "Run a shell command.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read file contents.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"file_path": {"type": "string"}},
-            "required": ["file_path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["file_path", "content"],
-        },
-    },
-    {
-        "name": "edit_file",
-        "description": "Edit the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"}
-            },
-            "required": ["file_path", "old_text", "new_text"],
-        },
-    },
-    {
-        "name": "glob",
-        "description": "Find files by pattern.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"pattern": {"type": "string"}},
-            "required": ["pattern"],
-        },
-    },
-    {"name": "todo_list", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-         "required": ["todos"],
-     },
-    },
-    {"name": "load_skill", "description": "Load the full content of a skill by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-     {"name": "compact", "description": "Summarize earlier conversation to free context space.",
-     "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
-     {"name": "create_task",
-     "description": "Create a new task with optional blockedBy dependencies.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "subject": {"type": "string"},
-                          "description": {"type": "string"},
-                          "blockedBy": {"type": "array",
-                                        "items": {"type": "string"}}},
-                      "required": ["subject"]}},
-    {"name": "list_tasks",
-     "description": "List all tasks with status, owner, and dependencies.",
-     "input_schema": {"type": "object", "properties": {},
-                      "required": []}},
-    {"name": "get_task",
-     "description": "Get full details of a specific task by ID.",
-     "input_schema": {"type": "object",
-                      "properties": {"task_id": {"type": "string"}},
-                      "required": ["task_id"]}},
-    {"name": "claim_task",
-     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
-     "input_schema": {"type": "object",
-                      "properties": {"task_id": {"type": "string"}},
-                      "required": ["task_id"]}},
-    {"name": "complete_task",
-     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
-     "input_schema": {"type": "object",
-                      "properties": {"task_id": {"type": "string"}},
-                      "required": ["task_id"]}},
-    {"name": "schedule_cron",
-     "description": "Schedule a cron job. cron is 5-field: min hour dom month dow.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "cron": {"type": "string",
-                                   "description": "5-field cron expression"},
-                          "prompt": {"type": "string",
-                                     "description": "Message to inject when fired"},
-                          "recurring": {"type": "boolean",
-                                        "description": "True=recurring, False=one-shot"},
-                          "durable": {"type": "boolean",
-                                      "description": "True=persist to disk"}},
-                      "required": ["cron", "prompt"]}},
-    {"name": "list_crons",
-     "description": "List all registered cron jobs.",
-     "input_schema": {"type": "object", "properties": {},
-                      "required": []}},
-    {"name": "cancel_cron",
-     "description": "Cancel a cron job by ID.",
-     "input_schema": {"type": "object",
-                      "properties": {"job_id": {"type": "string"}},
-                      "required": ["job_id"]}},
-    #  TEAM_AGENT_TOOLS  # 这些工具只在多agent模式下可用，单agent模式下禁用
-    {"name": "spawn_teammate",
-     "description": "Spawn a teammate agent in a background thread.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "name": {"type": "string"},
-                          "role": {"type": "string"},
-                          "prompt": {"type": "string"}},
-                      "required": ["name", "role", "prompt"]}},
-    {"name": "send_message",
-     "description": "Send a message to a teammate via MessageBus.",
-     "input_schema": {"type": "object",
-                      "properties": {"to": {"type": "string"},
-                                     "content": {"type": "string"}},
-                      "required": ["to", "content"]}},
-    {"name": "check_inbox",
-     "description": "Check Lead's inbox for teammate messages.",
-     "input_schema": {"type": "object", "properties": {},
-                      "required": []}},   
-    {"name": "request_shutdown",
-     "description": "Request a teammate to shut down gracefully.",
-     "input_schema": {"type": "object",
-                      "properties": {"teammate": {"type": "string"}},
-                      "required": ["teammate"]}},
-    {"name": "request_plan",
-     "description": "Ask a teammate to submit a plan for review.",
-     "input_schema": {"type": "object",
-                      "properties": {"teammate": {"type": "string"},
-                                     "task": {"type": "string"}},
-                      "required": ["teammate", "task"]}},
-    {"name": "review_plan",
-     "description": "Approve or reject a submitted plan by request_id.",
-     "input_schema": {"type": "object",
-                      "properties": {
-                          "request_id": {"type": "string"},
-                          "approve": {"type": "boolean"},
-                          "feedback": {"type": "string"}},
-                      "required": ["request_id", "approve"]}},                                 
-]
-
 # SUB_TOOLS = [
 #     {"name": "bash", "description": "Run a shell command.",
 #      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -749,7 +658,8 @@ TOOLS = [
 #     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
 # })              
 
-def run_bash(command) -> str:
+def run_bash(command: str, cwd: Path | None = None) -> str:
+    base = cwd or WORKDIR
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
 
     # for d in dangerous:
@@ -757,12 +667,11 @@ def run_bash(command) -> str:
     #         return "Error: Command not allowed."
     if any(d in command for d in dangerous):
         return "Error: Command not allowed."
-
     try:
         r = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
+            cwd=base,
             capture_output=True,
             text=True,
             timeout=120,
@@ -774,24 +683,25 @@ def run_bash(command) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
     except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
+        return f"Error: {e}"        
 
-def safe_path(p: str) -> Path:
-    path = (WORKDIR / p).resolve()
-    if not path.is_relative_to(WORKDIR):
+def safe_path(p: str, base: Path | None = None) -> Path:
+    root = (base or WORKDIR).resolve()
+    path = (root / p).resolve()
+    if not path.is_relative_to(root):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-def run_read(file_path: str, limit: int | None = None) -> str:  # 可限制返回line个数
+def run_read(file_path: str, limit: int | None = None, cwd: Path | None = None) -> str:  # 可限制返回line个数
     try:
-        lines = safe_path(file_path).read_text(encoding="utf-8", errors="replace").splitlines() # 把读到的字符串按行分割成list = ["line1", "line2", ...]
+        lines = safe_path(file_path, cwd).read_text(encoding="utf-8", errors="replace").splitlines() # 把读到的字符串按行分割成list = ["line1", "line2", ...]
         if limit and limit < len(lines):
             lines = lines[:limit]
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
-def run_write(file_path: str, content: str) -> str:
+def run_write(file_path: str, content: str, cwd: Path | None = None) -> str:
     try:
         file_path = safe_path(file_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1291,9 +1201,9 @@ def should_run_background(tool_name: str, tool_input: dict) -> bool:
         return True
     return is_slow_operation(tool_name, tool_input)
 
-def execute_tool(block) -> str:
+def execute_tool(block, handlers:dict) -> str:
     """Execute a tool call block, return output."""
-    handler = TOOL_HANDLERS.get(block.name)
+    handler = handlers.get(block.name)
     if handler:
         return handler(**block.input)
     return f"Unknown tool: {block.name}"
@@ -1558,6 +1468,9 @@ def has_cron_queue() -> bool:
         return bool(cron_queue)
     
 def start_runtime():
+    recovered = recover_orphaned_tasks()
+    if recovered:
+        print(f"  \033[33m[recovery] requeued {len(recovered)} orphaned task(s)\033[0m")
     load_durable_jobs()
 
     scheduler = threading.Thread(
@@ -1582,32 +1495,60 @@ def start_runtime():
     inbox_processor.start()
 
 class MessageBus:
-    """File-based message bus. Each agent has a .jsonl inbox.
-    Read is destructive: read_text + unlink (consumes messages).
-    Teaching version: no file locking; real CC uses proper-lockfile."""
+    """Thread-safe file inbox with atomic drain semantics."""
 
-    def send(self, from_agent: str, to_agent: str, content: str,  # 格式化发送
-             msg_type: str = "message", metadata: dict = None):
-        msg = {"from": from_agent, "to": to_agent,
-               "content": content, "type": msg_type,
-               "ts": time.time(), "metadata": metadata or {}}
+    def __init__(self):
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _lock_for(self, agent: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(agent, threading.Lock())
+
+    def send(self, from_agent: str, to_agent: str, content: str,
+             msg_type: str = "message", metadata: dict | None = None):
+        msg = {
+            "from": from_agent,
+            "to": to_agent,
+            "content": content,
+            "type": msg_type,
+            "ts": time.time(),
+            "metadata": metadata or {},
+        }
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with self._lock_for(to_agent):
+            with inbox.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(msg, ensure_ascii=False) + "\n")
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
-        if not inbox.exists():
-            return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
-                if line.strip()]
-        inbox.unlink()  # consume: read + delete
-        return msgs
+        processing = MAILBOX_DIR / f"{agent}.{time.time_ns()}.processing"
+        with self._lock_for(agent):
+            if not inbox.exists():
+                return []
+            os.replace(inbox, processing)
+
+        messages = []
+        try:
+            for line_number, line in enumerate(
+                processing.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if not line.strip():
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    log_lifecycle(agent, "mailbox_decode_error",
+                                  line=line_number, error=str(exc))
+            return messages
+        finally:
+            processing.unlink(missing_ok=True)
 
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}  # Track spawned teammates
+TEAMMATES_LOCK = threading.Lock()
 
 @dataclass
 class ProtocolState:
@@ -1696,57 +1637,75 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
 
 IDLE_LOOP_INTERVAL = 5.0  # seconds
 IDLE_TIMEOUT = 60.0  # seconds
+MAX_WORK_TURNS = 10
 
-def scan_unclaimed_tasks() -> list[dict]:
-    unclaim = []
-    for t in sorted(TASKS_DIR.glob("task_*.json")):  # 模式匹配搜索：按照文件名生成generator（Path iterator）后，再用sorted排序成list
-        task = json.loads(t.read_text())
-        if (task.get("status") == "pending" and not task.get("owner") and can_start_task(task["id"])):
-            unclaim.append(task)
-    return unclaim
 
-def idle_poll(agent_name: str, message: list, name: str, role: str) -> str:
-    """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
-    for _ in range(int(IDLE_TIMEOUT / IDLE_LOOP_INTERVAL)):  #  包含元素个数的列表的有效索引
+def scan_unclaimed_tasks() -> list[Task]:
+    """Return pending, unowned tasks whose dependencies are complete."""
+    with TASK_LOCK:
+        tasks = list_tasks()
+        return [
+            task for task in tasks
+            if task.status == "pending"
+            and not task.owner
+            and can_start_task(task.id)
+        ]
+
+
+def idle_poll(agent_name: str, messages: list,
+              name: str, role: str) -> str:
+    """Poll inbox and task board. Return work, shutdown, or timeout."""
+    attempts = max(1, int(IDLE_TIMEOUT / IDLE_LOOP_INTERVAL))
+    log_lifecycle(name, "idle_entered", timeout=IDLE_TIMEOUT, role=role)
+
+    for _ in range(attempts):
         time.sleep(IDLE_LOOP_INTERVAL)
 
-        # Check inbox — dispatch protocol messages first
         inbox = BUS.read_inbox(agent_name)
         if inbox:
-        # Check for shutdown_request
+            deliver = []
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
-                    req_id = msg.get("metadata", {}). get("request_id", "")
+                    req_id = msg.get("metadata", {}).get("request_id", "")
                     BUS.send(
-                        name, "lead", "Shutting down gracefully.", "shutdown_response", 
-                        {"request_id": req_id, "approve": True}
-                    )  
-                    print(f"  \033[35m[protocol] {name} approved shutdown "
-                            f"in idle ({req_id})\033[0m")
+                        name, "lead", "Shutting down gracefully.",
+                        "shutdown_response",
+                        {"request_id": req_id, "approve": True},
+                    )
+                    log_lifecycle(name, "shutdown_received", request_id=req_id,
+                                  phase="idle")
                     return "shutdown"
-            
-            # Non-protocol inbox: inject and resume work
-            message.append({"role": "user",
-                "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
-            print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
-            return "work"   
-        
-        # Scan task board
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task["id"], agent_name)
-            if "Claimed" in result:
-                message.append({
+                deliver.append(msg)
+
+            if deliver:
+                messages.append({
                     "role": "user",
-                    "content": f"<auto-claimed>Task {task['id']}: "
-                            f"{task['subject']}</auto-claimed>"
+                    "content": "<inbox>" + json.dumps(deliver) + "</inbox>",
                 })
-                print(f"  \033[32m[idle] {name} auto-claimed: "
-                        f"{task['subject']}\033[0m")
+                log_lifecycle(name, "inbox_wakeup", count=len(deliver))
                 return "work"
-        
-    print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
+
+        for task in scan_unclaimed_tasks():
+            result = claim_task(task.id, agent_name)
+            if result.startswith("Claimed "):
+                wt_info = ""
+                if task.worktree:
+                    wt_path = WORKTREES_DIR / task["worktree"]
+                    wt_info = f"\nWork directory: {wt_path}"
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"<auto-claimed>Task {task.id}: {task.subject}\n"
+                        f"{wt_info}{task.description}</auto-claimed>"
+                    ),
+                })
+                log_lifecycle(name, "idle_to_work", task_id=task.id,
+                              subject=task.subject)
+                return "work"
+            log_lifecycle(name, "claim_race_lost", task_id=task.id,
+                          result=result)
+
+    log_lifecycle(name, "idle_timeout", timeout=IDLE_TIMEOUT)
     return "timeout"
 
 # Track spawned teammates
@@ -1756,8 +1715,10 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     Teaching version: max 10 rounds per teammate.
     Real CC: teammates use idle loop (wait for inbox, work, repeat)
     until shutdown_request."""
-    if name in active_teammates:
-        return f"Teammate '{name}' already exists"
+    with TEAMMATES_LOCK:
+        if name in active_teammates:
+            return f"Teammate '{name}' already exists"
+        active_teammates[name] = True
 
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
@@ -1835,6 +1796,21 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                               "required": ["task_id"]}},
         ]
 
+        # Track current worktree for this teammate's cwd
+        wt_ctx = {"path": None}
+
+        def _wt_cwd() -> Path | None:
+            p = wt_ctx["path"]
+            return Path(p) if p else None
+        
+        def _run_bash(command: str) -> str:
+            return run_bash(command, cwd=_wt_cwd())
+        
+        def _run_read(path: str) -> str:
+            return run_read(path, cwd=_wt_cwd())
+
+        def _run_write(path: str, content: str) -> str:
+            return run_write(path, content, cwd=_wt_cwd())
 
         def _run_list_tasks():
             tasks = list_tasks()
@@ -1842,16 +1818,27 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                 return "No tasks."
             return "\n".join(
                 f"  {t.id}: {t.subject} [{t.status}]"
-                for t in tasks)
+                + (f" (wt:{t.worktree})" if t.worktree else "")
+                    for t in tasks)
 
         def _run_claim_task(task_id: str):
-            return claim_task(task_id, owner=name)
+            result = claim_task(task_id, owner=name)
+            if "Claimed" in result:
+                # Set worktree cwd if task has one
+                task = load_task(task_id)
+                if task.worktree:
+                    wt_ctx["path"] = str(WORKTREES_DIR / task.worktree)
+                else:
+                    wt_ctx["path"] = None 
+            return result
 
         def _run_complete_task(task_id: str):
-            return complete_task(task_id)
+            result = complete_task(task_id, owner=name)
+            wt_ctx["path"] = None
+            return result
         
         sub_handlers = {
-            "bash": run_bash, "read_file": run_read, "write_file": run_write,
+            "bash": _run_bash, "read_file": _run_read, "write_file": _run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
                                                   "Sent")[1],
             "submit_plan": lambda plan: _teammate_submit_plan(name, plan),
@@ -1861,111 +1848,149 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         }
 
-        # Outer loop: WORK → IDLE cycle
-        while True:
-            # Identity re-injection (s17)
-            if len(messages) <= 3:
-                messages.insert(0, {"role": "user",
-                    "content": f"<identity>You are '{name}', role: {role}. "
-                               f"Continue your work.</identity>"})
+        log_lifecycle(name, "thread_started", role=role)
+        final_reason = "unknown"
+        try:
+            while True:
+                if len(messages) <= 3:
+                    messages.insert(0, {
+                        "role": "user",
+                        "content": (
+                            f"<identity>You are '{name}', role: {role}. "
+                            "Continue your work.</identity>"
+                        ),
+                    })
 
-            shutdown_requested = False
-            for _ in range(10):
-                # Check inbox for protocol messages
-                inbox = BUS.read_inbox(name)
-                should_stop = False
-                non_protocol = []
-                for msg in inbox:
-                    if msg.get("type") in ("shutdown_request", "plan_approval_response"):
-                        should_stop = handle_inbox_message(name, msg, messages)
-                        if should_stop:
-                            break
-                    else:
-                        non_protocol.append(msg)
-                if should_stop:
-                    shutdown_requested = True
-                    break
-                if non_protocol:
-                    inbox_json = json.dumps(non_protocol)
-                    messages.append({"role": "user",
-                        "content": "<inbox>" + inbox_json + "</inbox>"})
+                should_shutdown = False
+                fatal_error = False
+                work_completed = False
+                log_lifecycle(name, "work_entered", message_count=len(messages))
 
-                # LLM turn
-            # for _ in range(10):
-            #     inbox = BUS.read_inbox(name)
-            #     if inbox:
-            #         messages.append({"role": "user",
-            #                          "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-                try:
-                    response = client.messages.create(
-                        model=MODEL, system=system, messages=messages[-20:],
-                        tools=sub_tools, max_tokens=8000)
-                except Exception:
-                    break
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
-                # Idle: wait for inbox messages instead of exiting
-                    # Real CC sends idle_notification to Lead here
-                    while not shutdown_requested:
-                        time.sleep(1)
-                        inbox = BUS.read_inbox(name)
-                        if not inbox:
+                for turn in range(1, MAX_WORK_TURNS + 1):
+                    inbox = BUS.read_inbox(name)
+                    non_protocol = []
+                    for msg in inbox:
+                        if msg.get("type") in (
+                            "shutdown_request", "plan_approval_response"
+                        ):
+                            if handle_inbox_message(name, msg, messages):
+                                should_shutdown = True
+                                break
+                        else:
+                            non_protocol.append(msg)
+
+                    if should_shutdown:
+                        break
+
+                    if non_protocol:
+                        messages.append({
+                            "role": "user",
+                            "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>",
+                        })
+                        log_lifecycle(name, "inbox_delivered",
+                                      count=len(non_protocol), phase="work")
+
+                    log_lifecycle(name, "llm_turn_started", turn=turn)
+                    try:
+                        response = client.messages.create(
+                            model=MODEL,
+                            system=system,
+                            messages=messages[-20:],
+                            tools=sub_tools,
+                            max_tokens=8000,
+                        )
+                    except Exception as exc:
+                        final_reason = "llm_error"
+                        fatal_error = True
+                        log_lifecycle(name, "llm_error",
+                                      error=f"{type(exc).__name__}: {exc}")
+                        break
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content,
+                    })
+                    log_lifecycle(name, "llm_turn_finished", turn=turn,
+                                  stop_reason=response.stop_reason)
+
+                    if response.stop_reason != "tool_use":
+                        work_completed = True
+                        break
+
+                    results = []
+                    for block in response.content:
+                        if block.type != "tool_use":
                             continue
-                        for msg in inbox:
-                            if msg.get("type") in ("shutdown_request", "plan_approval_response"):
-                                should_stop = handle_inbox_message(name, msg, messages)
-                                if should_stop:
-                                    shutdown_requested = True
-                                    break
-                            else:
-                                non_protocol.append(msg)
-                        if shutdown_requested:
-                            break
-                        if non_protocol:
-                            inbox_json = json.dumps(non_protocol)
-                            messages.append({"role": "user",
-                                "content": "<inbox>" + inbox_json + "</inbox>"})
-                            break  # back to LLM turn with new messages 
-
-                results = []
-                for block in response.content:
-                    if block.type == "tool_use":
                         handler = sub_handlers.get(block.name)
-                        output = handler(**block.input) if handler else "Unknown"
-                        results.append({"type": "tool_result",
-                                        "tool_use_id": block.id,
-                                        "content": str(output)})
-                messages.append({"role": "user", "content": results})
+                        try:
+                            output = handler(**block.input) if handler else "Unknown"
+                        except Exception as exc:
+                            output = f"Error: {type(exc).__name__}: {exc}"
+                            log_lifecycle(name, "tool_error", tool=block.name,
+                                          error=str(exc))
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
 
-                if shutdown_requested:
+                    messages.append({"role": "user", "content": results})
+
+                if should_shutdown:
+                    final_reason = "shutdown"
                     break
+                if fatal_error:
+                    break
+                if not work_completed:
+                    log_lifecycle(name, "work_turn_limit",
+                                  max_turns=MAX_WORK_TURNS)
 
-                # IDLE phase (s17 new)
                 idle_result = idle_poll(name, messages, name, role)
+                log_lifecycle(name, "idle_finished", result=idle_result)
+                if idle_result == "work":
+                    continue
                 if idle_result == "shutdown":
                     break
                 if idle_result == "timeout":
                     break
-
-            # Send final summary to Lead
+                final_reason = idle_result
+                break
+        except Exception as exc:
+            final_reason = "crashed"
+            log_lifecycle(name, "thread_crashed",
+                          error=f"{type(exc).__name__}: {exc}")
+        finally:
             summary = "Done."
             for msg in reversed(messages):
-                if msg["role"] == "assistant" and isinstance(msg["content"], list):
-                    for b in msg["content"]:
-                        if getattr(b, "type", None) == "text":
-                            summary = b.text
-                            break
-                    else:
-                        continue
+                if msg["role"] != "assistant" or not isinstance(msg["content"], list):
+                    continue
+                text_blocks = [
+                    block.text for block in msg["content"]
+                    if getattr(block, "type", None) == "text"
+                ]
+                if text_blocks:
+                    summary = "\n".join(text_blocks)
                     break
-            BUS.send(name, "lead", summary, "result")
+            try:
+                BUS.send(name, "lead", summary, "result", {
+                    "lifecycle_reason": final_reason,
+                })
+            except Exception as exc:
+                log_lifecycle(name, "summary_send_failed", error=str(exc))
+            release_tasks_for_owner(name, final_reason)
+            with TEAMMATES_LOCK:
+                active_teammates.pop(name, None)
+            log_lifecycle(name, "thread_stopped", reason=final_reason)
+            print(f"  \033[32m[teammate] {name} finished ({final_reason})\033[0m")
+    try:
+        thread = threading.Thread(target=run, daemon=True, name=f"teammate-{name}")
+        thread.start()
+    except Exception:
+        with TEAMMATES_LOCK:
             active_teammates.pop(name, None)
-            print(f"  \033[32m[teammate] {name} finished\033[0m")
-
-    active_teammates[name] = True
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    return f"Teammate '{name}' spawned as {role}."   
+        raise
+    log_lifecycle(name, "thread_dispatched", role=role)
+    return f"Teammate '{name}' spawned as {role} (autonomous)."
 # ── Team Tool Handlers ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
@@ -2024,7 +2049,431 @@ def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
     print(f"  \033[32m[protocol] plan {icon} ({request_id})\033[0m")
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
-TOOL_HANDLERS = {
+
+# ── Worktree System (s18 new) ──
+
+WORKTREES_DIR = WORKDIR / ".worktrees"
+WORKTREES_DIR.mkdir(exist_ok=True)
+
+VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
+
+def validate_worktree_name(name: str) -> str | None:
+    """Return error message if invalid, None if valid."""
+    if not name:
+        return "Worktree name cannot be empty"
+    if name == "." or name == "..":
+        return f"'{name}' is not a valid worktree name"
+    if not VALID_WT_NAME.match(name):
+        return (f"Invalid worktree name '{name}': "
+                "only letters, digits, dots, underscores, dashes (1-64 chars)")
+    return None
+
+def run_git(args: list[str]) -> tuple[bool, str]:
+    """Run git command. Return (ok, output)."""
+    try:
+        r = subprocess.run(["git"] + args, cwd=WORKDIR,  #  subprocess来自标准库执行外部指令
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout + r.stderr).strip()
+        out = out[:5000] if out else "(no output)"
+        return r.returncode == 0, out
+    except subprocess.TimeoutExpired:
+        return False, "Error: git timeout"
+    
+def log_event(event_type: str, worktree_name: str, task_id: str = ""):
+    """Append a lifecycle event to events.jsonl."""
+    event = {"type": event_type, "worktree": worktree_name,
+             "task_id": task_id, "ts": time.time()}
+    events_file = WORKTREES_DIR / "events.jsonl"
+    with open(events_file, "a") as f:
+        f.write(json.dumps(event) + "\n")
+
+def create_worktree(name: str, task_id: str = "") -> str:
+    """Create a git worktree with a dedicated branch. Optionally bind to a task."""
+    err = validate_worktree_name(name)
+    if err:
+        return f"Error: {err}"
+    path = WORKTREES_DIR / name
+    if path.exists():
+        return f"Worktree '{name}' already exists at {path}"
+    ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
+    if not ok:
+        return f"Git error: {result}"
+    if task_id:
+        bind_task_to_worktree(task_id, name)
+    log_event("create", name, task_id)
+    print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
+    return f"Worktree '{name}' created at {path}"
+
+def bind_task_to_worktree(task_id: str, worktree_name: str):
+    """Write worktree field to task. Keep status as pending for auto-claim."""
+    task = load_task(task_id)
+    task.worktree = worktree_name
+    _save_task(task)
+    print(f"  \033[33m[bind] {task.subject} → worktree:{worktree_name}\033[0m")
+
+def _count_worktree_changes(path: Path) -> tuple[int, int]:
+    """Count uncommitted files and commits in a worktree."""
+    try:
+        r1 = subprocess.run(["git", "status", "--porcelain"],
+                            cwd=path, capture_output=True, text=True, timeout=10)
+        files = len([l for l in r1.stdout.strip().splitlines() if l.strip()])
+        r2 = subprocess.run(["git", "log", "@{push}..HEAD", "--oneline"],
+                            cwd=path, capture_output=True, text=True, timeout=10)
+        commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
+        return files, commits
+    except Exception:
+        return -1, -1
+    
+def remove_worktree(name: str, discard_changes: bool = False) -> str:
+    err = validate_worktree_name(name)
+    if err:
+        return err
+    path = WORKTREES_DIR / name
+    if not path.exists():
+        return f"Worktree '{name}' not found"
+    if not discard_changes:
+        files, commits = _count_worktree_changes(path)
+        if files < 0:
+            return (f"Cannot verify worktree '{name}' status. "
+                    "Use discard_changes=true to force removal.")
+        if files > 0 or commits > 0:
+            return (f"Worktree '{name}' has {files} uncommitted file(s) "
+                    f"and {commits} unpushed commit(s). "
+                    "Use discard_changes=true to force removal, "
+                    "or keep_worktree to preserve for review.")
+    ok1, _ = run_git(["worktree", "remove", str(path), "--force"])
+    if not ok1:
+        return f"Failed to remove worktree directory for '{name}'"
+    run_git(["branch", "-D", f"wt/{name}"])
+    log_event("remove", name)
+    print(f"  \033[33m[worktree] removed: {name}\033[0m")
+    return f"Worktree '{name}' removed"
+
+def keep_worktree(name: str) -> str:
+    """Keep worktree for manual review. Branch preserved."""
+    err = validate_worktree_name(name)
+    if err:
+        return err
+    log_event("keep", name)
+    print(f"  \033[36m[worktree] kept: {name}\033[0m")
+    return f"Worktree '{name}' kept for review (branch: wt/{name})"    
+              
+
+# ── Lead Worktree Tools (s18 new) ──
+
+def run_create_worktree(name: str, task_id: str = "") -> str:
+    return create_worktree(name, task_id)
+
+
+def run_remove_worktree(name: str, discard_changes: bool = False) -> str:
+    return remove_worktree(name, discard_changes)
+
+
+def run_keep_worktree(name: str) -> str:
+    return keep_worktree(name)
+
+# ── MCP System (s19 new) ──
+
+class MCPClient:
+    """Discovers and calls tools on an MCP server (mock for teaching)."""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.tools: list[dict] = []
+        self._handlers: dict[str, callable] = {}
+
+    def register(self, tool_defs: list[dict],
+                 handlers: dict[str, callable]):
+        self.tools = tool_defs
+        self._handlers = handlers
+
+    def call_tool(self, tool_name: str, args: dict) -> str:
+        handler = self._handlers.get(tool_name)
+        if not handler:
+            return f"MCP error: unknown tool '{tool_name}'"
+        try:
+            return handler(**args)
+        except Exception as e:
+            return f"MCP error: {e}"
+        
+mcp_clients: dict[str, MCPClient] = {}
+
+#  所有非 `[a-zA-Z0-9_-]` 的字符替换为 `_`。防止 server 名或工具名中包含特殊字符导致命名冲突或注入问题
+_DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
+def normalize_mcp_name(name: str) -> str:
+    """Replace non [a-zA-Z0-9_-] with underscore."""
+    return _DISALLOWED_CHARS.sub('_', name)
+
+
+def _mock_server_docs():
+    client = MCPClient("docs")
+    client.register(
+        tool_defs=[
+            {"name": "search", "description": "Search documentation. (readOnly)",
+             "inputSchema": {"type": "object",
+                             "properties": {"query": {"type": "string"}},
+                             "required": ["query"]}},
+            {"name": "get_version", "description": "Get API version. (readOnly)",
+             "inputSchema": {"type": "object", "properties": {},
+                             "required": []}},
+        ],
+        handlers={
+            "search": lambda query: f"[docs] Found 3 results for '{query}'",
+            "get_version": lambda: "[docs] API v2.1.0",
+        })
+    return client                     
+
+def _mock_server_deploy():
+    client = MCPClient("deploy")
+    client.register(
+        tool_defs=[
+            {"name": "trigger",
+             "description": "Trigger a deployment. (destructive — requires approval in real CC)",
+             "inputSchema": {"type": "object",
+                             "properties": {"service": {"type": "string"}},
+                             "required": ["service"]}},
+            {"name": "status", "description": "Check deployment status. (readOnly)",
+             "inputSchema": {"type": "object",
+                             "properties": {"service": {"type": "string"}},
+                             "required": ["service"]}},
+        ],
+        handlers={
+            "trigger": lambda service: f"[deploy] Triggered: {service}",
+            "status": lambda service: f"[deploy] {service}: running (v1.4.2)",
+        })
+    return client
+
+MOCK_SERVERS = {
+    "docs": _mock_server_docs,
+    "deploy": _mock_server_deploy,
+}
+
+def connect_mcp(name: str) -> str:
+    if name in mcp_clients:
+        return f"MCP server '{name}' already connected"
+    factory = MOCK_SERVERS.get(name)
+    if not factory:
+        available = ", ".join(MOCK_SERVERS.keys())
+        return f"Unknown server '{name}'. Available: {available}"
+    mcp_client = factory()
+    mcp_clients[name] = mcp_client
+    tool_names = [t["name"] for t in mcp_client.tools]
+    print(f"  \033[31m[mcp] connected: {name} → {tool_names}\033[0m")
+    return (f"Connected to MCP server '{name}'. "
+            f"Discovered {len(mcp_client.tools)} tools: {', '.join(tool_names)}")
+
+def assemble_tool_pool() -> tuple[list[dict], dict]:
+    """Assemble builtin tools + all MCP tools into one pool."""
+    #  复制内置工具
+    tools = list(BUILTIN_TOOLS) 
+    handlers = dict(BUILTIN_HANDLERS)
+    for server_name, mcp_client in mcp_clients.items():
+        safe_server = normalize_mcp_name(server_name)
+        for tool_def in mcp_client.tools:
+            safe_tool = normalize_mcp_name(tool_def["name"])
+            prefixed = f"mcp__{safe_server}__{safe_tool}"
+            tools.append({
+                "name": prefixed,
+                "description": tool_def.get("description", ""),
+                "input_schema": tool_def.get("inputSchema", {}),
+            })
+            handlers[prefixed] = (
+                lambda *, c=mcp_client, t=tool_def["name"], **kw: c.call_tool(t, kw))  #  单独的 * 表示：后面的参数必须用关键字传入，不能用位置参数传入。
+    return tools, handlers
+
+def run_connect_mcp(name: str) -> str:
+    return connect_mcp(name)
+
+# 工具说明书
+BUILTIN_TOOLS = [
+    {
+        "name": "bash",
+        "description": "Run a shell command.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read file contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"file_path": {"type": "string"}},
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "content": {"type": "string"},
+            },
+            "required": ["file_path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Edit the contents of a file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"}
+            },
+            "required": ["file_path", "old_text", "new_text"],
+        },
+    },
+    {
+        "name": "glob",
+        "description": "Find files by pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    },
+    {"name": "todo_list", "description": "Create and manage a task list ...",
+     "input_schema": {
+         "type": "object",
+         "properties": {
+             "todos": {
+                 "type": "array",
+                 "items": {
+                     "type": "object",
+                     "properties": {
+                         "content": {"type": "string"},
+                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                     },
+                 },
+             },
+         },
+         "required": ["todos"],
+     },
+    },
+    {"name": "load_skill", "description": "Load the full content of a skill by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+     {"name": "compact", "description": "Summarize earlier conversation to free context space.",
+     "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
+     {"name": "create_task",
+     "description": "Create a new task with optional blockedBy dependencies.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "subject": {"type": "string"},
+                          "description": {"type": "string"},
+                          "blockedBy": {"type": "array",
+                                        "items": {"type": "string"}}},
+                      "required": ["subject"]}},
+    {"name": "list_tasks",
+     "description": "List all tasks with status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "get_task",
+     "description": "Get full details of a specific task by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "claim_task",
+     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "complete_task",
+     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "schedule_cron",
+     "description": "Schedule a cron job. cron is 5-field: min hour dom month dow.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "cron": {"type": "string",
+                                   "description": "5-field cron expression"},
+                          "prompt": {"type": "string",
+                                     "description": "Message to inject when fired"},
+                          "recurring": {"type": "boolean",
+                                        "description": "True=recurring, False=one-shot"},
+                          "durable": {"type": "boolean",
+                                      "description": "True=persist to disk"}},
+                      "required": ["cron", "prompt"]}},
+    {"name": "list_crons",
+     "description": "List all registered cron jobs.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "cancel_cron",
+     "description": "Cancel a cron job by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"job_id": {"type": "string"}},
+                      "required": ["job_id"]}},
+    #  TEAM_AGENT_TOOLS  # 这些工具只在多agent模式下可用，单agent模式下禁用
+    {"name": "spawn_teammate",
+     "description": "Spawn a teammate agent in a background thread.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "name": {"type": "string"},
+                          "role": {"type": "string"},
+                          "prompt": {"type": "string"}},
+                      "required": ["name", "role", "prompt"]}},
+    {"name": "send_message",
+     "description": "Send a message to a teammate via MessageBus.",
+     "input_schema": {"type": "object",
+                      "properties": {"to": {"type": "string"},
+                                     "content": {"type": "string"}},
+                      "required": ["to", "content"]}},
+    {"name": "check_inbox",
+     "description": "Check Lead's inbox for teammate messages.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},   
+    {"name": "request_shutdown",
+     "description": "Request a teammate to shut down gracefully.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"}},
+                      "required": ["teammate"]}},
+    {"name": "request_plan",
+     "description": "Ask a teammate to submit a plan for review.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"},
+                                     "task": {"type": "string"}},
+                      "required": ["teammate", "task"]}},
+    {"name": "review_plan",
+     "description": "Approve or reject a submitted plan by request_id.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "request_id": {"type": "string"},
+                          "approve": {"type": "boolean"},
+                          "feedback": {"type": "string"}},
+                      "required": ["request_id", "approve"]}},    
+    # s18 new: worktree tools
+    {"name": "create_worktree",
+     "description": "Create an isolated git worktree with its own branch.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "task_id": {"type": "string"}},
+                      "required": ["name"]}},
+    {"name": "remove_worktree",
+     "description": "Remove a worktree. Refuses if uncommitted changes unless discard_changes=true.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "discard_changes": {"type": "boolean"}},
+                      "required": ["name"]}},
+    {"name": "keep_worktree",
+     "description": "Keep a worktree for manual review.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},
+    {"name": "connect_mcp",
+     "description": "Connect to an MCP server (docs, deploy) and discover tools.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},                                               
+]
+
+BUILTIN_HANDLERS = {
     # "task": spawn_subagent,
     "bash": run_bash,
     "read_file": run_read,
@@ -2044,7 +2493,10 @@ TOOL_HANDLERS = {
     "request_shutdown": run_request_shutdown,
     "request_plan": run_request_plan,
     "review_plan": run_review_plan,
-
+    "create_worktree": run_create_worktree,
+    "remove_worktree": run_remove_worktree,
+    "keep_worktree": run_keep_worktree,
+    "connect_mcp": run_connect_mcp
 }
 # SUB_TOOL_HANDLERS = {
 #     "bash": run_bash, "read_file": run_read, "write_file": run_write,
@@ -2065,6 +2517,7 @@ def agent_loop(context: dict, message: list):
     rounds_since_todo = 0
     reactive_retries = 0
 
+    tools, handlers = assemble_tool_pool()
     # s10改动：即使调用方传入旧 context，这里也会基于当前 message 重新派生一次。
     context = update_context(context, message)
     system = get_system_prompt(context)
@@ -2124,7 +2577,7 @@ def agent_loop(context: dict, message: list):
                 lambda mt=max_tokens:  # 默认参数 = 定义时按值冻结
                     client.messages.create(
                         model=state.current_model, system=system, messages=message,
-                        tools=TOOLS, max_tokens=mt),
+                        tools=tools, max_tokens=mt),
                 state)
             reactive_retries = 0
         except Exception as e:
@@ -2209,7 +2662,7 @@ def agent_loop(context: dict, message: list):
                                 "content": str(blocked)})
                 continue
 
-            tool_handler = TOOL_HANDLERS.get(block.name)
+            tool_handler = handlers.get(block.name)
             if not tool_handler:
                 # s10改动：未知工具也要返回 tool_result，否则 API 会看到未配对的 tool_use。
                 output = f"Unknown tool: {block.name}"
@@ -2228,7 +2681,7 @@ def agent_loop(context: dict, message: list):
                             f"Result will be available when complete."
                         )
             else:
-                output = execute_tool(block)
+                output = execute_tool(block, handlers)
 
             trigger_hooks("PostToolUse", block, output)
             if block.name == "todo_list":
@@ -2248,6 +2701,10 @@ def agent_loop(context: dict, message: list):
                   f"notification(s)\033[0m")
         message.append({"role": "user", "content": user_content})
         
+        if any(b.name == "connect_mcp" for b in response.content
+               if b.type == "tool_use"):
+            tools, handlers = assemble_tool_pool()
+
         if compact_after_tool_round:
             # s10改动：现在 assistant tool_use 和 user tool_result 已经配对，可以安全压缩整段历史为普通 user summary。
             message[:] = compact_history(message)
@@ -2357,7 +2814,7 @@ def inbox_processor_loop():
             agent_lock.release()
 
 if __name__ == "__main__":
-    print("s14_agent_loop")
+    print("s17_autonomous_agent_loop")
     print("Enter a question and press Enter to send. Type exit to quit.\n")
 
     start_runtime()
@@ -2385,11 +2842,11 @@ if __name__ == "__main__":
             #     update_inbox_history(inbox_text)
             #     print(f"\n  \033[33m[inbox] {len(inbox)} new message(s)\033[0m")
             # Check inbox → route protocol + inject into history
-        inbox_msgs = consume_lead_inbox(route_protocol=True)
-        if inbox_msgs:
-            inbox_text = "\n".join(
-                f"From {m['from']}: {m['content'][:200]}" for m in inbox_msgs)
-            session_history.append({"role": "user",
-                            "content": f"[Inbox]\n{inbox_text}"})
-            print(f"\n\033[33m[Inbox: {len(inbox_msgs)} messages injected]\033[0m")
+        # inbox_msgs = consume_lead_inbox(route_protocol=True)
+        # if inbox_msgs:
+        #     inbox_text = "\n".join(
+        #         f"From {m['from']}: {m['content'][:200]}" for m in inbox_msgs)
+        #     session_history.append({"role": "user",
+        #                     "content": f"[Inbox]\n{inbox_text}"})
+        #     print(f"\n\033[33m[Inbox: {len(inbox_msgs)} messages injected]\033[0m")
         print()    

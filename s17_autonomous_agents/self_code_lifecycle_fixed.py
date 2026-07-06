@@ -155,6 +155,21 @@ def update_context(context: dict, messages: list) -> dict:
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
+TASK_LOCK = threading.RLock()
+LIFECYCLE_LOG_DIR = WORKDIR / ".agent_logs"
+LIFECYCLE_LOG_DIR.mkdir(exist_ok=True)
+LIFECYCLE_LOG_LOCK = threading.Lock()
+
+
+def log_lifecycle(agent: str, event: str, **details):
+    """Write one structured lifecycle event for debugging and recovery."""
+    record = {"ts": time.time(), "agent": agent, "event": event, **details}
+    path = LIFECYCLE_LOG_DIR / f"{agent}.jsonl"
+    with LIFECYCLE_LOG_LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    detail_text = " ".join(f"{key}={value}" for key, value in details.items())
+    print(f"  \033[90m[lifecycle] {agent}: {event} {detail_text}\033[0m")
 
 @dataclass
 class Task:
@@ -170,13 +185,25 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description:str = "", blockedBy: list[str] | None = None) -> Task:
     """Create a new task and save it to disk."""
-    id = f"task_{int(time.time())}_{random.randint(1000,9999):04d}"
-    task = Task(id=id, subject=subject, description=description, status="pending", owner=None, blockedBy=blockedBy or [])
-    _save_task(task)
+    with TASK_LOCK:
+        while True:
+            id = f"task_{int(time.time())}_{random.randint(1000,9999):04d}"
+            if not _task_path(id).exists():
+                break
+        task = Task(id=id, subject=subject, description=description, status="pending", owner=None, blockedBy=blockedBy or [])
+        _save_task(task)
     return task
 
+
 def _save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), ensure_ascii=False, indent=2))  # asdict把 dataclass 对象转换成 dict 字典|中文不转义|JSON缩进两格
+    path = _task_path(task.id)
+    temp_path = path.with_suffix(".json.tmp")
+    temp_path.write_text(
+        json.dumps(asdict(task), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(temp_path, path)
+
 def load_task(task_id: str) -> Task | None:
     return Task(**json.loads(_task_path(task_id).read_text())) 
 def list_tasks() -> list[Task]:
@@ -196,34 +223,76 @@ def can_start_task(task_id: str) -> bool:
 
 task_lock = threading.Lock()
 def claim_task(task_id: str, owner: str) -> str:
-    with task_lock:    
-        """Claim a task for a specific agent."""
+    """Atomically claim a pending, unowned, unblocked task."""
+    with TASK_LOCK:
         task = load_task(task_id)
         if task.status != "pending":
-            return f"Error: Task {task_id} can't claim."
+            return f"Error: Task {task_id} is {task.status}, can't claim."
+        if task.owner:
+            return f"Error: Task {task_id} already owned by {task.owner}."
         if not can_start_task(task_id):
-            deps = [d for d in task.blockedBy if not _task_path(d).exists() or load_task(d).status != "completed"] #  ps：先判断文件是否存在，再读文件，否则如果文件不存在会熔断
+            deps = [d for d in task.blockedBy if not _task_path(d).exists() or load_task(d).status != "completed"]
             return f"Blocked by: {deps}"
         task.owner = owner
         task.status = "in_progress"
         _save_task(task)
     print(f"  \033[36m[claim] {task.subject} → in_progress (owner: {owner})\033[0m")
+    log_lifecycle(owner, "task_claimed", task_id=task.id, subject=task.subject)
     return f"Claimed {task.id} ({task.subject})"
 
-def complete_task(task_id: str) -> str:
-    """Mark a task as completed."""
-    task = load_task(task_id)
-    if task.status != "in_progress":
-        return f"Error: Task {task_id} can't complete."
-    task.status = "completed"
-    _save_task(task)
+
+def complete_task(task_id: str, owner: str | None = None) -> str:
+    """Complete a task, optionally enforcing its current owner."""
+    with TASK_LOCK:
+        task = load_task(task_id)
+        if task.status != "in_progress":
+            return f"Error: Task {task_id} is {task.status}, can't complete."
+        if owner is not None and task.owner != owner:
+            return f"Error: Task {task_id} owned by {task.owner}, not {owner}."
+        task.status = "completed"
+        _save_task(task)
     print(f"  \033[32m[complete] {task.subject} → completed\033[0m")
+    log_lifecycle(owner or task.owner or "agent", "task_completed", task_id=task.id, subject=task.subject)
     msg = f"Completed {task.id} ({task.subject})"
     unblocked = [t.subject for t in list_tasks() if t.status == "pending" and can_start_task(t.id) and t.blockedBy]
     if unblocked:
         msg += f"\nUnblocked tasks: {', '.join(unblocked)}"
         print(f"  \033[33m[unblocked] {', '.join(unblocked)}\033[0m")
     return msg
+
+def release_tasks_for_owner(owner: str, reason: str) -> list[str]:
+    """Return tasks owned by a stopped teammate to the pending queue."""
+    released = []
+    with TASK_LOCK:
+        for task in list_tasks():
+            if task.status != "in_progress" or task.owner != owner:
+                continue
+            task.status = "pending"
+            task.owner = None
+            _save_task(task)
+            released.append(task.id)
+    if released:
+        log_lifecycle(owner, "tasks_requeued", task_ids=released, reason=reason)
+    return released
+
+
+def recover_orphaned_tasks(active_owners: set[str] | None = None) -> list[str]:
+    """Recover in-progress tasks whose owners are not active after restart."""
+    active_owners = active_owners or set()
+    recovered = []
+    with TASK_LOCK:
+        for task in list_tasks():
+            if task.status != "in_progress" or not task.owner:
+                continue
+            if task.owner in active_owners:
+                continue
+            previous_owner = task.owner
+            task.status = "pending"
+            task.owner = None
+            _save_task(task)
+            recovered.append(task.id)
+            log_lifecycle(previous_owner, "orphan_recovered", task_id=task.id)
+    return recovered
 
 
 
@@ -1558,6 +1627,9 @@ def has_cron_queue() -> bool:
         return bool(cron_queue)
     
 def start_runtime():
+    recovered = recover_orphaned_tasks()
+    if recovered:
+        print(f"  \033[33m[recovery] requeued {len(recovered)} orphaned task(s)\033[0m")
     load_durable_jobs()
 
     scheduler = threading.Thread(
@@ -1582,32 +1654,60 @@ def start_runtime():
     inbox_processor.start()
 
 class MessageBus:
-    """File-based message bus. Each agent has a .jsonl inbox.
-    Read is destructive: read_text + unlink (consumes messages).
-    Teaching version: no file locking; real CC uses proper-lockfile."""
+    """Thread-safe file inbox with atomic drain semantics."""
 
-    def send(self, from_agent: str, to_agent: str, content: str,  # 格式化发送
-             msg_type: str = "message", metadata: dict = None):
-        msg = {"from": from_agent, "to": to_agent,
-               "content": content, "type": msg_type,
-               "ts": time.time(), "metadata": metadata or {}}
+    def __init__(self):
+        self._locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _lock_for(self, agent: str) -> threading.Lock:
+        with self._locks_guard:
+            return self._locks.setdefault(agent, threading.Lock())
+
+    def send(self, from_agent: str, to_agent: str, content: str,
+             msg_type: str = "message", metadata: dict | None = None):
+        msg = {
+            "from": from_agent,
+            "to": to_agent,
+            "content": content,
+            "type": msg_type,
+            "ts": time.time(),
+            "metadata": metadata or {},
+        }
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "a") as f:
-            f.write(json.dumps(msg) + "\n")
+        with self._lock_for(to_agent):
+            with inbox.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(msg, ensure_ascii=False) + "\n")
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
               f"{content[:50]}\033[0m")
 
     def read_inbox(self, agent: str) -> list[dict]:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
-        if not inbox.exists():
-            return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
-                if line.strip()]
-        inbox.unlink()  # consume: read + delete
-        return msgs
+        processing = MAILBOX_DIR / f"{agent}.{time.time_ns()}.processing"
+        with self._lock_for(agent):
+            if not inbox.exists():
+                return []
+            os.replace(inbox, processing)
+
+        messages = []
+        try:
+            for line_number, line in enumerate(
+                processing.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                if not line.strip():
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError as exc:
+                    log_lifecycle(agent, "mailbox_decode_error",
+                                  line=line_number, error=str(exc))
+            return messages
+        finally:
+            processing.unlink(missing_ok=True)
 
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}  # Track spawned teammates
+TEAMMATES_LOCK = threading.Lock()
 
 @dataclass
 class ProtocolState:
@@ -1696,57 +1796,71 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
 
 IDLE_LOOP_INTERVAL = 5.0  # seconds
 IDLE_TIMEOUT = 60.0  # seconds
+MAX_WORK_TURNS = 10
 
-def scan_unclaimed_tasks() -> list[dict]:
-    unclaim = []
-    for t in sorted(TASKS_DIR.glob("task_*.json")):  # 模式匹配搜索：按照文件名生成generator（Path iterator）后，再用sorted排序成list
-        task = json.loads(t.read_text())
-        if (task.get("status") == "pending" and not task.get("owner") and can_start_task(task["id"])):
-            unclaim.append(task)
-    return unclaim
 
-def idle_poll(agent_name: str, message: list, name: str, role: str) -> str:
-    """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
-    for _ in range(int(IDLE_TIMEOUT / IDLE_LOOP_INTERVAL)):  #  包含元素个数的列表的有效索引
+def scan_unclaimed_tasks() -> list[Task]:
+    """Return pending, unowned tasks whose dependencies are complete."""
+    with TASK_LOCK:
+        tasks = list_tasks()
+        return [
+            task for task in tasks
+            if task.status == "pending"
+            and not task.owner
+            and can_start_task(task.id)
+        ]
+
+
+def idle_poll(agent_name: str, messages: list,
+              name: str, role: str) -> str:
+    """Poll inbox and task board. Return work, shutdown, or timeout."""
+    attempts = max(1, int(IDLE_TIMEOUT / IDLE_LOOP_INTERVAL))
+    log_lifecycle(name, "idle_entered", timeout=IDLE_TIMEOUT, role=role)
+
+    for _ in range(attempts):
         time.sleep(IDLE_LOOP_INTERVAL)
 
-        # Check inbox — dispatch protocol messages first
         inbox = BUS.read_inbox(agent_name)
         if inbox:
-        # Check for shutdown_request
+            deliver = []
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
-                    req_id = msg.get("metadata", {}). get("request_id", "")
+                    req_id = msg.get("metadata", {}).get("request_id", "")
                     BUS.send(
-                        name, "lead", "Shutting down gracefully.", "shutdown_response", 
-                        {"request_id": req_id, "approve": True}
-                    )  
-                    print(f"  \033[35m[protocol] {name} approved shutdown "
-                            f"in idle ({req_id})\033[0m")
+                        name, "lead", "Shutting down gracefully.",
+                        "shutdown_response",
+                        {"request_id": req_id, "approve": True},
+                    )
+                    log_lifecycle(name, "shutdown_received", request_id=req_id,
+                                  phase="idle")
                     return "shutdown"
-            
-            # Non-protocol inbox: inject and resume work
-            message.append({"role": "user",
-                "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
-            print(f"  \033[36m[idle] {name} found inbox messages\033[0m")
-            return "work"   
-        
-        # Scan task board
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task["id"], agent_name)
-            if "Claimed" in result:
-                message.append({
+                deliver.append(msg)
+
+            if deliver:
+                messages.append({
                     "role": "user",
-                    "content": f"<auto-claimed>Task {task['id']}: "
-                            f"{task['subject']}</auto-claimed>"
+                    "content": "<inbox>" + json.dumps(deliver) + "</inbox>",
                 })
-                print(f"  \033[32m[idle] {name} auto-claimed: "
-                        f"{task['subject']}\033[0m")
+                log_lifecycle(name, "inbox_wakeup", count=len(deliver))
                 return "work"
-        
-    print(f"  \033[31m[idle] {name} timeout ({IDLE_TIMEOUT}s)\033[0m")
+
+        for task in scan_unclaimed_tasks():
+            result = claim_task(task.id, agent_name)
+            if result.startswith("Claimed "):
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        f"<auto-claimed>Task {task.id}: {task.subject}\n"
+                        f"{task.description}</auto-claimed>"
+                    ),
+                })
+                log_lifecycle(name, "idle_to_work", task_id=task.id,
+                              subject=task.subject)
+                return "work"
+            log_lifecycle(name, "claim_race_lost", task_id=task.id,
+                          result=result)
+
+    log_lifecycle(name, "idle_timeout", timeout=IDLE_TIMEOUT)
     return "timeout"
 
 # Track spawned teammates
@@ -1756,8 +1870,10 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     Teaching version: max 10 rounds per teammate.
     Real CC: teammates use idle loop (wait for inbox, work, repeat)
     until shutdown_request."""
-    if name in active_teammates:
-        return f"Teammate '{name}' already exists"
+    with TEAMMATES_LOCK:
+        if name in active_teammates:
+            return f"Teammate '{name}' already exists"
+        active_teammates[name] = True
 
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
@@ -1848,7 +1964,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             return claim_task(task_id, owner=name)
 
         def _run_complete_task(task_id: str):
-            return complete_task(task_id)
+            return complete_task(task_id, owner=name)
         
         sub_handlers = {
             "bash": run_bash, "read_file": run_read, "write_file": run_write,
@@ -1861,111 +1977,145 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         }
 
-        # Outer loop: WORK → IDLE cycle
-        while True:
-            # Identity re-injection (s17)
-            if len(messages) <= 3:
-                messages.insert(0, {"role": "user",
-                    "content": f"<identity>You are '{name}', role: {role}. "
-                               f"Continue your work.</identity>"})
+        log_lifecycle(name, "thread_started", role=role)
+        final_reason = "unknown"
+        try:
+            while True:
+                if len(messages) <= 3:
+                    messages.insert(0, {
+                        "role": "user",
+                        "content": (
+                            f"<identity>You are '{name}', role: {role}. "
+                            "Continue your work.</identity>"
+                        ),
+                    })
 
-            shutdown_requested = False
-            for _ in range(10):
-                # Check inbox for protocol messages
-                inbox = BUS.read_inbox(name)
-                should_stop = False
-                non_protocol = []
-                for msg in inbox:
-                    if msg.get("type") in ("shutdown_request", "plan_approval_response"):
-                        should_stop = handle_inbox_message(name, msg, messages)
-                        if should_stop:
-                            break
-                    else:
-                        non_protocol.append(msg)
-                if should_stop:
-                    shutdown_requested = True
-                    break
-                if non_protocol:
-                    inbox_json = json.dumps(non_protocol)
-                    messages.append({"role": "user",
-                        "content": "<inbox>" + inbox_json + "</inbox>"})
+                should_shutdown = False
+                fatal_error = False
+                work_completed = False
+                log_lifecycle(name, "work_entered", message_count=len(messages))
 
-                # LLM turn
-            # for _ in range(10):
-            #     inbox = BUS.read_inbox(name)
-            #     if inbox:
-            #         messages.append({"role": "user",
-            #                          "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-                try:
-                    response = client.messages.create(
-                        model=MODEL, system=system, messages=messages[-20:],
-                        tools=sub_tools, max_tokens=8000)
-                except Exception:
-                    break
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
-                # Idle: wait for inbox messages instead of exiting
-                    # Real CC sends idle_notification to Lead here
-                    while not shutdown_requested:
-                        time.sleep(1)
-                        inbox = BUS.read_inbox(name)
-                        if not inbox:
+                for turn in range(1, MAX_WORK_TURNS + 1):
+                    inbox = BUS.read_inbox(name)
+                    non_protocol = []
+                    for msg in inbox:
+                        if msg.get("type") in (
+                            "shutdown_request", "plan_approval_response"
+                        ):
+                            if handle_inbox_message(name, msg, messages):
+                                should_shutdown = True
+                                break
+                        else:
+                            non_protocol.append(msg)
+
+                    if should_shutdown:
+                        break
+
+                    if non_protocol:
+                        messages.append({
+                            "role": "user",
+                            "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>",
+                        })
+                        log_lifecycle(name, "inbox_delivered",
+                                      count=len(non_protocol), phase="work")
+
+                    log_lifecycle(name, "llm_turn_started", turn=turn)
+                    try:
+                        response = client.messages.create(
+                            model=MODEL,
+                            system=system,
+                            messages=messages[-20:],
+                            tools=sub_tools,
+                            max_tokens=8000,
+                        )
+                    except Exception as exc:
+                        final_reason = "llm_error"
+                        fatal_error = True
+                        log_lifecycle(name, "llm_error",
+                                      error=f"{type(exc).__name__}: {exc}")
+                        break
+
+                    messages.append({
+                        "role": "assistant",
+                        "content": response.content,
+                    })
+                    log_lifecycle(name, "llm_turn_finished", turn=turn,
+                                  stop_reason=response.stop_reason)
+
+                    if response.stop_reason != "tool_use":
+                        work_completed = True
+                        break
+
+                    results = []
+                    for block in response.content:
+                        if block.type != "tool_use":
                             continue
-                        for msg in inbox:
-                            if msg.get("type") in ("shutdown_request", "plan_approval_response"):
-                                should_stop = handle_inbox_message(name, msg, messages)
-                                if should_stop:
-                                    shutdown_requested = True
-                                    break
-                            else:
-                                non_protocol.append(msg)
-                        if shutdown_requested:
-                            break
-                        if non_protocol:
-                            inbox_json = json.dumps(non_protocol)
-                            messages.append({"role": "user",
-                                "content": "<inbox>" + inbox_json + "</inbox>"})
-                            break  # back to LLM turn with new messages 
-
-                results = []
-                for block in response.content:
-                    if block.type == "tool_use":
                         handler = sub_handlers.get(block.name)
-                        output = handler(**block.input) if handler else "Unknown"
-                        results.append({"type": "tool_result",
-                                        "tool_use_id": block.id,
-                                        "content": str(output)})
-                messages.append({"role": "user", "content": results})
+                        try:
+                            output = handler(**block.input) if handler else "Unknown"
+                        except Exception as exc:
+                            output = f"Error: {type(exc).__name__}: {exc}"
+                            log_lifecycle(name, "tool_error", tool=block.name,
+                                          error=str(exc))
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        })
 
-                if shutdown_requested:
+                    messages.append({"role": "user", "content": results})
+
+                if should_shutdown:
+                    final_reason = "shutdown"
                     break
+                if fatal_error:
+                    break
+                if not work_completed:
+                    log_lifecycle(name, "work_turn_limit",
+                                  max_turns=MAX_WORK_TURNS)
 
-                # IDLE phase (s17 new)
                 idle_result = idle_poll(name, messages, name, role)
-                if idle_result == "shutdown":
-                    break
-                if idle_result == "timeout":
-                    break
-
-            # Send final summary to Lead
+                log_lifecycle(name, "idle_finished", result=idle_result)
+                if idle_result == "work":
+                    continue
+                final_reason = idle_result
+                break
+        except Exception as exc:
+            final_reason = "crashed"
+            log_lifecycle(name, "thread_crashed",
+                          error=f"{type(exc).__name__}: {exc}")
+        finally:
             summary = "Done."
             for msg in reversed(messages):
-                if msg["role"] == "assistant" and isinstance(msg["content"], list):
-                    for b in msg["content"]:
-                        if getattr(b, "type", None) == "text":
-                            summary = b.text
-                            break
-                    else:
-                        continue
+                if msg["role"] != "assistant" or not isinstance(msg["content"], list):
+                    continue
+                text_blocks = [
+                    block.text for block in msg["content"]
+                    if getattr(block, "type", None) == "text"
+                ]
+                if text_blocks:
+                    summary = "\n".join(text_blocks)
                     break
-            BUS.send(name, "lead", summary, "result")
+            try:
+                BUS.send(name, "lead", summary, "result", {
+                    "lifecycle_reason": final_reason,
+                })
+            except Exception as exc:
+                log_lifecycle(name, "summary_send_failed", error=str(exc))
+            release_tasks_for_owner(name, final_reason)
+            with TEAMMATES_LOCK:
+                active_teammates.pop(name, None)
+            log_lifecycle(name, "thread_stopped", reason=final_reason)
+            print(f"  \033[32m[teammate] {name} finished ({final_reason})\033[0m")
+    try:
+        thread = threading.Thread(target=run, daemon=True, name=f"teammate-{name}")
+        thread.start()
+    except Exception:
+        with TEAMMATES_LOCK:
             active_teammates.pop(name, None)
-            print(f"  \033[32m[teammate] {name} finished\033[0m")
-
-    active_teammates[name] = True
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    return f"Teammate '{name}' spawned as {role}."   
+        raise
+    log_lifecycle(name, "thread_dispatched", role=role)
+    return f"Teammate '{name}' spawned as {role} (autonomous)."
 # ── Team Tool Handlers ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
@@ -2357,7 +2507,7 @@ def inbox_processor_loop():
             agent_lock.release()
 
 if __name__ == "__main__":
-    print("s14_agent_loop")
+    print("s17_autonomous_agent_loop")
     print("Enter a question and press Enter to send. Type exit to quit.\n")
 
     start_runtime()
